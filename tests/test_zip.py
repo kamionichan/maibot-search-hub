@@ -39,6 +39,39 @@ def test_zip_allowlist_and_import(tmp_path):
 def test_check_rejects_unlisted_module(tmp_path):
     import shutil
     shutil.copytree(ROOT, tmp_path / "r", ignore=shutil.ignore_patterns(".venv*", ".git", "__pycache__", "dist"))
-    (tmp_path / "r" / "hub" / "stray.py").write_text("x = 1\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="白名单"):
+    # 0.5.5：hub/*.py 通配会自动收进新模块；改为检查“白名单里的文件缺失”和“声明的图标不在包里”
+    (tmp_path / "r" / "KEYS.md").unlink()
+    with pytest.raises(ValueError, match="不是仓库里的普通文件"):
         build_zip.check(tmp_path / "r")
+
+
+def test_zip_contains_icon_and_changelog():
+    import json
+    m = json.loads((ROOT / "_manifest.json").read_text(encoding="utf-8"))
+    assert m["display"]["icon"]["value"] in build_zip.FILES
+    assert m["changelog"] in build_zip.FILES
+    assert not any(f.startswith(("docs/", "probes/", ".gitea/")) or f in ("AGENTS.md", "tools/private_patterns.txt")
+                   for f in build_zip.read_list(ROOT)["zip"] + build_zip.read_list(ROOT)["repo"])
+
+
+def test_release_check_and_stage(tmp_path):
+    sys.path.insert(0, str(ROOT / "tools"))
+    import release
+    assert release.check() == []
+    dest = tmp_path / "public"
+    (dest / ".git").mkdir(parents=True)
+    (dest / ".git" / "keep").write_text("x", encoding="utf-8")
+    (dest / "old_file.txt").write_text("stale", encoding="utf-8")
+    release.stage(dest)
+    names = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+    assert "old_file.txt" not in names and ".git/keep" in names and ".gitignore" in names
+    assert set(release.release_files()) <= set(names)
+    assert release.changelog_section(build_zip.version())
+
+
+def test_release_scan_catches_private_info():
+    sys.path.insert(0, str(ROOT / "tools"))
+    import release
+    sample = ("see " + "/ro" + "ot/workspace/x and " + ".lo" + "cal/testbed/y").encode()
+    found = release.scan({"a.md": sample})
+    assert len(found) == 2

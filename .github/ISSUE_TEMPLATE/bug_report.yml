@@ -1,0 +1,36 @@
+name: 问题反馈
+description: 报告 bug 或使用中遇到的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先看 README 的「常见问题」。
+        **不要贴出任何 API Key、QQ 号或群聊截图里的私人信息。**
+  - type: input
+    id: versions
+    attributes:
+      label: 版本
+      description: 插件版本、MaiBot 版本（WebUI 插件管理页能看到）
+      placeholder: "插件 0.5.5，MaiBot 1.3.18"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 你做了什么、期望看到什么、实际看到什么
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: /search status 的输出（可选）
+      description: 在聊天里发 /search status，把回复贴在这里
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志（可选）
+      description: MaiBot 日志里包含 search_hub 的行。请先删掉 key 和网址里的私人参数
+      render: text

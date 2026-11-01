@@ -174,7 +174,7 @@ def _owned(name: Any) -> bool:
         name.startswith(_RENAMED_PREFIX) and name[len(_RENAMED_PREFIX):] in OWNED_TOOLS))
 
 
-PLUGIN_VERSION = "0.5.4"
+PLUGIN_VERSION = "0.5.5"
 KEYED_SOURCES = ("langsearch", "bocha", "baidu", "qwen", "exa", "brave", "parallel", "linkup", "firecrawl", "serper", "perplexity")
 
 

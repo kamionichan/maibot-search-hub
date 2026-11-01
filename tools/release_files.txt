@@ -1,0 +1,26 @@
+# 发布白名单：只有这里列出的文件会进入安装包或 GitHub 发布仓库。
+# 一行一个，相对仓库根目录；支持结尾的 /*.py 通配（只匹配该目录下一层的 .py）。
+# 新增插件模块、新增随插件发布的文档时，记得加到这里；tools/release.py check 会拦下漏列的 hub/ 模块。
+#
+# [zip]  安装包内容（也会进入发布仓库）
+# [repo] 只进发布仓库、不进安装包的文件（测试、打包脚本等）
+
+[zip]
+__init__.py
+_manifest.json
+plugin.py
+README.md
+CHANGELOG.md
+KEYS.md
+LICENSE
+THIRD_PARTY_NOTICES.md
+icon.svg
+hub/*.py
+
+[repo]
+pytest.ini
+tests/*.py
+tools/build_zip.py
+tools/release.py
+tools/release_files.txt
+.github/ISSUE_TEMPLATE/bug_report.yml

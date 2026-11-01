@@ -1,11 +1,11 @@
 {
   "manifest_version": 2,
-  "version": "0.5.4",
+  "version": "0.5.5",
   "name": "MaiBot 搜索中枢",
   "description": "统一的搜索编排与对话衔接：自动组合多个搜索来源，长搜索转后台不占用聊天，结果带编号自然接回对话。",
   "author": {"name": "kamionichan", "url": "https://github.com/kamionichan"},
   "license": "MIT",
-  "urls": {"repository": "https://github.com/kamionichan/maibot-search-hub"},
+  "urls": {"repository": "https://github.com/kamionichan/maibot-search-hub", "issues": "https://github.com/kamionichan/maibot-search-hub/issues"},
   "host_application": {"min_version": "1.3.17", "max_version": "1.3.99"},
   "sdk": {"min_version": "2.19.0", "max_version": "2.99.0"},
   "capabilities": ["maisaka.proactive.trigger", "maisaka.context.resolve_image", "send.text", "web.search", "web.fetch", "api.call", "component.list_loaded_plugins"],
@@ -13,5 +13,7 @@
   "id": "kamionichan.search_hub",
   "dependencies": [
     {"type": "python_package", "name": "httpx", "version_spec": ">=0.28.1,<0.29"}
-  ]
+  ],
+  "display": {"icon": {"type": "local", "value": "icon.svg", "fallback": "search", "background": "#4f7cff"}},
+  "changelog": "CHANGELOG.md"
 }
