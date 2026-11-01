@@ -187,4 +187,4 @@ def classify_host_error(text: str) -> SourceError:
         return SourceError(Outcome.UNKNOWN, f"HTTP {code}", status=code)
     if "连接失败" in text and ("ConnectError" in text or "ConnectTimeout" in text):
         return SourceError(Outcome.NOT_SENT, "连接失败")
-    return SourceError(Outcome.UNKNOWN, text[:80] or "未知错误")
+    return SourceError(Outcome.UNKNOWN, text or "未知错误")   # SourceError 自己先脱敏再截断

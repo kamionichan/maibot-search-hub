@@ -254,16 +254,22 @@ class JobManager:
         return f"已取消 {job_id}。已发出的请求不会追回，已拿到的结果仍保留在记录里。"
 
     async def shutdown(self) -> None:
+        """0.5.6（S1）：先取消并等任务结束（Executor 的 finally 会在这时把未完成请求交给 _tails），
+        再取消并等待全部尾部请求；最后确认没有遗留。之前是先拍 _tails 快照，漏掉了取消过程中新产生的。"""
         self._closing = True
         tasks = [j.task for j in self._jobs.values() if j.task and not j.task.done()]
         for t in tasks:
             t.cancel()
         for t in list(self._bg):
             t.cancel()
-        # 搜索结束后仍在跑的请求：插件要卸载了，一并取消（结果已无处可去）
-        for t in list(self._tails):
-            t.cancel()
-        pending = [*tasks, *self._bg, *self._tails]
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        if tasks or self._bg:
+            await asyncio.gather(*tasks, *list(self._bg), return_exceptions=True)
+        # 搜索结束后仍在跑的请求：插件要卸载了，一并取消（结果已无处可去；服务端是否已计费无法撤回）
+        for _ in range(3):   # 取消尾部请求时不会再产生新的尾部；循环只是保险
+            tails = [t for t in self._tails if not t.done()]
+            if not tails:
+                break
+            for t in tails:
+                t.cancel()
+            await asyncio.gather(*tails, return_exceptions=True)
         self.ledger.mark_interrupted()

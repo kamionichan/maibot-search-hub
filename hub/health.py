@@ -25,6 +25,7 @@ class _State:
 class Health:
     def __init__(self) -> None:
         self._s: dict[str, _State] = {}
+        self._gen: dict[str, int] = {}     # 0.5.6（S5）：每个来源当前的 key 代次
 
     def _st(self, name: str) -> _State:
         return self._s.setdefault(name, _State())
@@ -50,11 +51,15 @@ class Health:
         st.cooldown_until = 0.0
         st.reason = ""
 
-    def failure(self, name: str, err: SourceError) -> None:
+    def failure(self, name: str, err: SourceError, gen: int | None = None) -> None:
+        """gen：发出这次请求的 Provider 的 key 代次（0.5.6 S5）。换 key 之后，旧代次请求晚到的失败
+        （典型是旧 key 的 401）不再给新 key 加冷却；健康统计照计。"""
         if err.budget:
             return   # 预算挡下不是来源的问题，不计失败、不冷却
         st = self._st(name)
         st.fail += 1
+        if gen is not None and gen < self._gen.get(name, 0):
+            return
         now = time.monotonic()
         if err.unavailable:
             self._cool(st, now, 30 * 60, err.message)
@@ -81,8 +86,11 @@ class Health:
         st.cooldown_until = max(st.cooldown_until, now + seconds)
         st.reason = reason
 
-    def reset(self, name: str) -> None:
-        """0.5.3：管理员换了 key 等情况下解除冷却（延迟统计保留）。"""
+    def reset(self, name: str, gen: int | None = None) -> None:
+        """0.5.3：管理员换了 key 等情况下解除冷却（延迟统计保留）。
+        0.5.6：同时记下新的 key 代次，旧代次的失败之后不再影响冷却。"""
+        if gen is not None:
+            self._gen[name] = max(self._gen.get(name, 0), gen)
         st = self._s.get(name)
         if st is not None:
             st.cooldown_until, st.reason = 0.0, ""

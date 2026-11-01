@@ -146,7 +146,8 @@ def _keyed(cls_name: str, label: str, doc: str, url: str, daily: int, extra: dic
 BaiduSection = _keyed("BaiduSection", "百度千帆",
                       "中文效果最好。每天约 50 次免费，按天发放，需要实名。", "https://console.bce.baidu.com/qianfan", 50)
 ExaSection = _keyed("ExaSection", "Exa",
-                    "英文、技术类效果最好。每月 $10 免费额度，不用绑卡。", "https://dashboard.exa.ai", 60)
+                    "英文、技术类效果最好。每月 $10 免费额度（本插件用的 Auto 模式约 1400 次），不用绑卡。",
+                    "https://dashboard.exa.ai", 45)
 FirecrawlSection = _keyed("FirecrawlSection", "Firecrawl",
                           "每月 1000 credits（约 500 次搜索），不用绑卡。", "https://www.firecrawl.dev", 16)
 LangSearchSection = _keyed("LangSearchSection", "LangSearch",
@@ -154,7 +155,7 @@ LangSearchSection = _keyed("LangSearchSection", "LangSearch",
 BochaSection = _keyed("BochaSection", "博查",
                       "中文。注册送 1000 次，一次性，3 个月有效。", "https://open.bochaai.com", 30)
 LinkupSection = _keyed("LinkupSection", "Linkup",
-                       "注册送 $10（约 2000 次），一次性。", "https://app.linkup.so", 60)
+                       "免费额度以官网为准（本插件作者没有申请）。", "https://app.linkup.so", 60)
 SerperSection = _keyed("SerperSection", "Serper（Google 结果）",
                        "一次性 2500 次免费；转售 Google 搜索结果。", "https://serper.dev", 40)
 BraveSection = _keyed("BraveSection", "Brave（需绑卡）",

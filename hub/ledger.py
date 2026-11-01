@@ -14,12 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from .merge import Merged
+from .net import redact
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
   session_id TEXT NOT NULL, sn INTEGER NOT NULL, url_key TEXT NOT NULL,
   url TEXT NOT NULL, title TEXT, snippet TEXT, published_at TEXT, sources TEXT,
-  first_seen REAL, last_seen REAL, hits INTEGER DEFAULT 1, used INTEGER DEFAULT 0,
+  first_seen REAL, last_seen REAL, hits INTEGER DEFAULT 1, used INTEGER DEFAULT 0, reads INTEGER DEFAULT 0,
   PRIMARY KEY (session_id, sn)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS entries_url ON entries(session_id, url_key);
@@ -58,7 +59,25 @@ class Ledger:
             path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path) if path else ":memory:", isolation_level=None)
         self._db.executescript(SCHEMA)
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(entries)")}
+        if "reads" not in cols:   # 0.5.6：旧库补列
+            self._db.execute("ALTER TABLE entries ADD COLUMN reads INTEGER DEFAULT 0")
         self.per_session = per_session
+        self._seed_counters()
+
+    def _seed_counters(self) -> None:
+        """0.5.6（S3）：0.5.1 及更早的数据库没有 S 编号计数器。打开时、在任何清理或清空之前，
+        为每个已有会话按现存最大编号补上计数器，之后删掉旧记录也不会让编号从 S1 重来。
+        已经在旧版本里被删掉的编号无从得知，这一点是迁移的限制。"""
+        self._db.execute("BEGIN")
+        try:
+            self._db.execute(
+                "INSERT INTO counters (name, value) SELECT 'sn:' || session_id, MAX(sn) FROM entries"
+                " GROUP BY session_id ON CONFLICT(name) DO UPDATE SET value = MAX(value, excluded.value)")
+            self._db.execute("COMMIT")
+        except Exception:
+            self._db.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         self._db.close()
@@ -71,17 +90,20 @@ class Ledger:
         cur.execute("BEGIN")
         try:
             for m in results:
+                # 0.5.6（B2）：所有结果都经过这里才进入账本、卡片和回复参考资料，标题和摘要在此脱敏。
+                # 网址原样保存（读取原文要用）；展示时由 cards 去掉凭据参数。
+                title, snippet = redact(m.title), redact(m.snippet)
                 row = cur.execute("SELECT sn, hits FROM entries WHERE session_id=? AND url_key=?",
                                   (session_id, m.key)).fetchone()
                 if row:
                     cur.execute("UPDATE entries SET last_seen=?, hits=hits+1, title=COALESCE(NULLIF(?, ''), title),"
                                 " snippet=CASE WHEN length(?)>length(snippet) THEN ? ELSE snippet END,"
                                 " published_at=COALESCE(published_at, ?) WHERE session_id=? AND sn=?",
-                                (now, m.title, m.snippet, m.snippet, m.published_at, session_id, row[0]))
-                    out.append(Entry(row[0], m.url, m.title, m.snippet, m.published_at, m.sources, False))
+                                (now, title, snippet, snippet, m.published_at, session_id, row[0]))
+                    out.append(Entry(row[0], m.url, title, snippet, m.published_at, m.sources, False))
                     continue
                 # F10：S 编号用每会话独立的递增计数器（counters 表 sn:<会话>），条目被清理/淘汰后编号也不复用，
-                # 旧对话里的 S 编号不会指到别的网址。老数据库首次使用时从现有最大编号起算。
+                # 旧对话里的 S 编号不会指到别的网址。计数器在打开数据库时就为已有会话补齐（0.5.6 S3）。
                 ck = f"sn:{session_id}"
                 if cur.execute("SELECT 1 FROM counters WHERE name=?", (ck,)).fetchone() is None:
                     base = cur.execute("SELECT COALESCE(MAX(sn), 0) FROM entries WHERE session_id=?",
@@ -89,10 +111,11 @@ class Ledger:
                     cur.execute("INSERT INTO counters VALUES (?, ?)", (ck, base))
                 cur.execute("UPDATE counters SET value=value+1 WHERE name=?", (ck,))
                 sn = cur.execute("SELECT value FROM counters WHERE name=?", (ck,)).fetchone()[0]
-                cur.execute("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?,1,0)",
-                            (session_id, sn, m.key, m.url, m.title, m.snippet, m.published_at,
+                cur.execute("INSERT INTO entries (session_id, sn, url_key, url, title, snippet, published_at, sources,"
+                            " first_seen, last_seen, hits, used) VALUES (?,?,?,?,?,?,?,?,?,?,1,0)",
+                            (session_id, sn, m.key, m.url, title, snippet, m.published_at,
                              json.dumps(m.sources), now, now))
-                out.append(Entry(sn, m.url, m.title, m.snippet, m.published_at, m.sources, True))
+                out.append(Entry(sn, m.url, title, snippet, m.published_at, m.sources, True))
             # 每会话上限：按 last_seen 淘汰（编号不复用，见上）
             n = cur.execute("SELECT COUNT(*) FROM entries WHERE session_id=?", (session_id,)).fetchone()[0]
             if n > self.per_session:
@@ -127,12 +150,16 @@ class Ledger:
         return [{"job_id": r[0], "query": r[1], "sns": json.loads(r[2] or "[]"), "finished": r[3]} for r in rows]
 
     def set_page(self, session_id: str, sn: int, excerpt_text: str) -> None:
+        """读过正文：用正文摘录替换较短的摘要，并计一次“读取”。0.5.6：摘录脱敏；读取次数单独计（reads），
+        不再混进 used（used 只表示“进了回复参考资料”的次数）。"""
+        ex = redact(excerpt_text)[:600]
         self._db.execute("UPDATE entries SET snippet=CASE WHEN length(?)>length(snippet) THEN ? ELSE snippet END,"
-                         " used=used+1 WHERE session_id=? AND sn=?", (excerpt_text[:600], excerpt_text[:600], session_id, sn))
+                         " reads=reads+1 WHERE session_id=? AND sn=?", (ex, ex, session_id, sn))
 
-    def mark_used(self, session_id: str, sns: list[int]) -> None:
+    def mark_shown(self, session_id: str, sns: list[int]) -> None:
+        """进过回复参考资料：used 置 1（只记一次，同一窗口内多次注入不重复累计）。"""
         if sns:
-            self._db.executemany("UPDATE entries SET used=used+1 WHERE session_id=? AND sn=?",
+            self._db.executemany("UPDATE entries SET used=1 WHERE session_id=? AND sn=?",
                                  [(session_id, s) for s in sns])
 
     def clear_session(self, session_id: str) -> int:

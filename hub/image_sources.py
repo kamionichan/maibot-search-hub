@@ -143,7 +143,7 @@ class AnimeTraceProvider:
         code = data.get("code")
         if code not in (0, "0"):
             msg = str(data.get("zh_message") or data.get("message") or f"错误码 {code}")
-            raise SourceError(Outcome.REJECTED, _clip(msg, 60), status=status)
+            raise SourceError(Outcome.REJECTED, msg, status=status)
         out: list[ImageHit] = []
         boxes = [b for b in (data.get("data") or []) if isinstance(b, dict)]
         for bi, box in enumerate(boxes):
@@ -206,9 +206,9 @@ class SauceNaoProvider:
             raw_msg = str(header.get("message") or "")
             msg = raw_msg.replace(self._key, "***") if len(self._key) >= 6 else raw_msg   # F03：与 set_secrets 同样的长度下限
             if st < 0:
-                raise SourceError(Outcome.REJECTED, _clip(msg or "请求被拒绝", 60), status=st,
+                raise SourceError(Outcome.REJECTED, msg or "请求被拒绝", status=st,
                                   auth_failed="api key" in raw_msg.lower())
-            raise SourceError(Outcome.UNKNOWN, _clip(msg or "服务端错误", 60), status=st)
+            raise SourceError(Outcome.UNKNOWN, msg or "服务端错误", status=st)
         out: list[ImageHit] = []
         for r in data.get("results") or []:
             h, d = r.get("header") or {}, r.get("data") or {}

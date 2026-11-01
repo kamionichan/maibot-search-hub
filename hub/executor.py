@@ -180,7 +180,7 @@ class Executor:
                 a.outcome, a.note, a.seconds = err.outcome.value, err.message, time.monotonic() - a.started
                 if charged and err.outcome is Outcome.NOT_SENT and self._sb is not None:
                     self._sb.paid_left += 1   # 请求没发出去：本次搜索的额度退回（每日计数保守地不退）
-                self.health.failure(p.info.name, err)
+                self.health.failure(p.info.name, err, p.info.extra.get("key_gen"))
                 if (err.outcome is Outcome.NOT_SENT and not err.unavailable and retry == 0
                         and self.health.available(p.info.name)):
                     await asyncio.sleep(1.0)
@@ -189,7 +189,7 @@ class Executor:
             except Exception as exc:  # noqa: BLE001
                 err = SourceError(Outcome.UNKNOWN, type(exc).__name__)
                 a.outcome, a.note, a.seconds = "unknown", err.message, time.monotonic() - a.started
-                self.health.failure(p.info.name, err)
+                self.health.failure(p.info.name, err, p.info.extra.get("key_gen"))
                 raise err from None
             a.seconds = time.monotonic() - a.started
             a.outcome, a.n = "ok", len(hits)

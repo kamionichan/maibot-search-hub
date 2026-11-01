@@ -133,7 +133,7 @@ class FirecrawlProvider(_Keyed):
         data = await self._http.post_json(self.URL, body, headers={"Authorization": f"Bearer {self._key}"},
                                           read_timeout=30.0)
         if isinstance(data, dict) and data.get("success") is False:
-            raise SourceError(Outcome.REJECTED, _clip(data.get("error") or "Firecrawl 拒绝", 80))
+            raise SourceError(Outcome.REJECTED, data.get("error") or "Firecrawl 拒绝")
         rows = _require(data, "data", "web")
         return _hits(self.info.name, rows, title="title", url="url", snippet="description")
 
@@ -233,7 +233,7 @@ class BochaProvider(_Keyed):
         data = await self._http.post_json(self.URL, body, headers={"Authorization": f"Bearer {self._key}"},
                                           quota_codes=frozenset({403}))
         if isinstance(data, dict) and data.get("code") not in (None, 200, "200"):
-            raise SourceError(Outcome.REJECTED, _clip(data.get("msg") or f"博查错误 {data.get('code')}", 80))
+            raise SourceError(Outcome.REJECTED, data.get("msg") or f"博查错误 {data.get('code')}")
         rows = _require(data, "data", "webPages", "value")
         # 只用 datePublished：dateLastCrawled 实为 UTC+8 却标 Z（官方文档承认）
         return _hits(self.info.name, rows, title="name", url="url", date="datePublished",
@@ -260,7 +260,7 @@ class LangSearchProvider(_Keyed):
             body["freshness"] = self.FRESH[freshness]
         data = await self._http.post_json(self.URL, body, headers={"Authorization": f"Bearer {self._key}"})
         if isinstance(data, dict) and data.get("code") not in (None, 200, "200"):
-            raise SourceError(Outcome.REJECTED, _clip(data.get("msg") or f"LangSearch 错误 {data.get('code')}", 80))
+            raise SourceError(Outcome.REJECTED, data.get("msg") or f"LangSearch 错误 {data.get('code')}")
         rows = _require(data, "data", "webPages", "value")
         return _hits(self.info.name, rows, title="name", url="url", date="datePublished",
                      snippet=lambda r: _first(r.get("text"), r.get("summary"), r.get("snippet")))
@@ -299,7 +299,7 @@ class BaiduProvider(_Keyed):
         if isinstance(data, dict) and data.get("code"):
             msg = str(data.get("message") or data.get("code"))
             quota = bool(re.search(r"quota|limit|额度|余额|欠费", msg, re.I))
-            raise SourceError(Outcome.REJECTED, _clip(msg, 80), quota_exhausted=quota)
+            raise SourceError(Outcome.REJECTED, msg, quota_exhausted=quota)
         rows = [r for r in (_require(data, "references") or []) if isinstance(r, dict) and r.get("type", "web") == "web"]
         hits = _hits(self.info.name, rows, title="title", url="url", date="date",
                      snippet=lambda r: _first(r.get("snippet"), r.get("content")))
@@ -341,7 +341,7 @@ class QwenSearchProvider(_Keyed):
         if isinstance(data, dict) and data.get("code") and not data.get("output"):
             msg = str(data.get("message") or data.get("code"))
             quota = bool(re.search(r"Arrearage|quota|余额|欠费", msg, re.I))
-            raise SourceError(Outcome.REJECTED, _clip(msg, 80), quota_exhausted=quota,
+            raise SourceError(Outcome.REJECTED, msg, quota_exhausted=quota,
                               auth_failed="InvalidApiKey" in str(data.get("code")))
         info = (_require(data, "output") or {}).get("search_info")
         if not isinstance(info, dict):

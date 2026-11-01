@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -47,6 +48,28 @@ def read_list(root: Path = ROOT) -> dict[str, list[str]]:
     return sections
 
 
+def git_tracked(root: Path = ROOT) -> set[str] | None:
+    """git 跟踪的文件；不是 git 仓库（例如从发布 ZIP 解出来的目录）时返回 None，不做这项检查。"""
+    try:
+        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {x for x in out.stdout.decode("utf-8").split("\0") if x}
+
+
+def check_file(root: Path, name: str, tracked: set[str] | None) -> None:
+    """0.5.6（B3）：[zip] 和 [repo] 两段都用这一项检查：必须是仓库里的普通文件、不是符号链接、
+    父目录也不是符号链接，并且已被 git 跟踪（工作区里随手放的文件不会被 *.py 通配带进发布）。"""
+    p = root / name
+    rp = root.resolve()
+    if p.is_symlink() or any(q.is_symlink() for q in p.parents if q != rp and rp in q.resolve().parents):
+        raise ValueError(f"{name} 是符号链接或在符号链接目录里")
+    if not p.is_file() or not p.resolve().is_relative_to(rp):
+        raise ValueError(f"{name} 不是仓库里的普通文件")
+    if tracked is not None and name not in tracked:
+        raise ValueError(f"{name} 没有被 git 跟踪（先提交，或从白名单/目录里移走）")
+
+
 def _files(root: Path) -> tuple[str, ...]:
     return tuple(read_list(root)["zip"])
 
@@ -63,12 +86,11 @@ def version(root: Path = ROOT) -> str:
 
 def check(root: Path = ROOT) -> dict[str, bytes]:
     files = _files(root)
+    tracked = git_tracked(root)
     payload: dict[str, bytes] = {}
     for name in files:
-        p = root / name
-        if p.is_symlink() or not p.is_file() or not p.resolve().is_relative_to(root.resolve()):
-            raise ValueError(f"{name} 不是仓库里的普通文件")
-        data = p.read_bytes()
+        check_file(root, name, tracked)
+        data = (root / name).read_bytes()
         if name.endswith(".py") and FORBIDDEN.search(data.decode("utf-8")):
             raise ValueError(f"{name} 里疑似写死了密钥")
         payload[name] = data

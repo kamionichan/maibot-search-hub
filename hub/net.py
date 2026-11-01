@@ -6,7 +6,8 @@
 - unknown：已发出但结果不明（读取超时、连接中断、5xx、响应无效）。**不重发同一来源**（D1），可以换源。
 
 0.5.2（INDEPENDENT_REVIEW F01/F02/F03，作者复核见 docs/REVIEW_AUTHOR_CHECK.md）：
-- 所有响应体经 read_limited()：读原始字节、分片解压、边解压边计数，超限立即停止；不会先解开整个压缩炸弹再检查。
+- 所有响应体经 read_limited()：读原始字节、自己逐步解压（0.5.6 起每一步的输出都有上限，并限制线缆字节），
+  只接受一层 gzip/deflate；超限立即停止，不会先解开整个压缩炸弹再检查。
   错误响应体不读，或只读一小段（以图搜接口需要业务码时）。
 - proxy 留空 = 直连，不继承环境变量里的代理（trust_env=False），与配置页说明一致。
 - 上游返回的文字（错误信息等）在进入模型、账本、trace 前经 redact() 脱敏：已配置的 key 与 URL 里的凭据参数。
@@ -18,16 +19,17 @@ import asyncio
 import json
 import logging
 import re
+import time
+import zlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import httpx
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 ERROR_BODY_BYTES = 16 * 1024
 USER_AGENT = "maibot-search-hub/0.5 (+https://github.com/kamionichan/maibot-search-hub)"
-_FEED = 16 * 1024   # 喂给解压器的单片大小：单片解压输出再大，也会在下一次计数时被拦下
 
 
 class Outcome(str, Enum):
@@ -46,28 +48,51 @@ class SourceError(Exception):
     auth_failed: bool = False
     unavailable: bool = False   # 来源本身未配置/未启用：长时间冷却，不重发
     budget: bool = False        # 0.5.3：被本次搜索的预算挡下（没有发出请求，也不是来源故障）
+    key_gen: int = 0            # 0.5.6（S5）：发出请求时 key 的代次；换 key 后旧代次的失败不影响新 key 的冷却
 
     def __post_init__(self) -> None:
-        self.message = redact(self.message)
+        # 0.5.6（B2）：先脱敏再截断，截断后的 key 残段也认不出来了
+        self.message = clip(redact(str(self.message or "")), MESSAGE_MAX)
+        super().__init__(self.message)   # args 也只保留脱敏后的文字
 
     def __str__(self) -> str:  # pragma: no cover - 仅用于日志
         return f"{self.outcome.value}: {self.message}"
+
+
+MESSAGE_MAX = 80
+
+
+def clip(text: Any, n: int) -> str:
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 class TooLarge(Exception):
     """解压后的响应体超过上限。"""
 
 
-# ---------------- 脱敏（F03） ----------------
+# ---------------- 脱敏（F03；0.5.6 B2 补全） ----------------
 _SECRET_PARAM = re.compile(r"((?<![A-Za-z0-9])(?:api[_-]?key|apikey|access[_-]?token|token|secret|signature|sig|key)=)[^&\s#\"'<>]+", re.I)
 _BEARER = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=\-]+", re.I)
+SECRET_GRACE = 600.0          # 换 key 后旧 key 继续脱敏的时长：覆盖仍在途的旧请求（任务时限最长 300 秒）
+_current: frozenset[str] = frozenset()
+_retired: dict[str, float] = {}    # 旧 key → 退役时间
 _secrets: tuple[str, ...] = ()
 
 
-def set_secrets(secrets: Iterable[str]) -> None:
-    """插件按当前配置登记所有 key（plugin._apply_config）。短于 6 个字符的不登记，避免误伤普通文字。"""
-    global _secrets
-    _secrets = tuple(sorted({s.strip() for s in secrets if s and len(s.strip()) >= 6}, key=len, reverse=True))
+def set_secrets(secrets: Iterable[str], *, now: float | None = None) -> None:
+    """插件按当前配置登记所有 key（plugin._apply_config）。短于 6 个字符的不登记，避免误伤普通文字。
+
+    0.5.6（B2）：不再整体覆盖。被换掉的旧 key 继续脱敏 SECRET_GRACE 秒，在途的旧请求回显旧 key 时也会被遮掉。"""
+    global _current, _secrets
+    t = time.monotonic() if now is None else now
+    new = frozenset(s.strip() for s in secrets if s and len(s.strip()) >= 6)
+    for old in _current - new:
+        _retired[old] = t
+    for k in [k for k, since in _retired.items() if t - since > SECRET_GRACE or k in new]:
+        _retired.pop(k, None)
+    _current = new
+    _secrets = tuple(sorted(new | set(_retired), key=len, reverse=True))
 
 
 def redact(text: str) -> str:
@@ -79,9 +104,15 @@ def redact(text: str) -> str:
     return _BEARER.sub(r"\1***", text)
 
 
+def redact_url(url: str) -> str:
+    """展示用：去掉网址里的凭据参数（token=、key= 等）和已登记的 key。读取时仍用原网址。"""
+    return redact(url)
+
+
 class RedactingFilter(logging.Filter):
     """挂在 httpx/httpcore 日志上：管理员打开这些库的日志时，请求 URL 里的 key 也会被遮掉（F03）。
-    SauceNAO 只接受 URL 参数里的 key（官方库 PicImageSearch 同样如此），所以从日志这一侧堵住。"""
+    SauceNAO 只接受 URL 参数里的 key（官方库 PicImageSearch 同样如此），所以从日志这一侧堵住。
+    0.5.6（B2）：异常堆栈文字（exc_info / exc_text）也一并脱敏。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
@@ -91,6 +122,11 @@ class RedactingFilter(logging.Filter):
         clean = redact(msg)
         if clean != msg:
             record.msg, record.args = clean, None
+        if record.exc_info:
+            record.exc_text = redact(logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact(record.exc_text)
         return True
 
 
@@ -106,11 +142,61 @@ def install_log_filter() -> None:
             lg.addFilter(_FILTER)
 
 
-# ---------------- 受限收包（F01） ----------------
+# ---------------- 受限收包（F01；0.5.6 B1 重写） ----------------
+# 0.5.2 的做法是把压缩数据分片喂给 httpx 的解码器，但 decode() 一次就会把一片完整解开，
+# 解压峰值不受限（第二轮审查 B1：8 KB 的 gzip 峰值 21 MB，两层 gzip 峰值 53 MB）。
+# 现在自己用 zlib 解压：每一步用 max_length 限定输出，只接受一层 gzip/deflate；请求也只声明这两种。
+ACCEPT_ENCODING = "gzip, deflate"
+WIRE_FACTOR = 4          # 线缆字节上限 = max_bytes × WIRE_FACTOR（压缩率很差的正常内容也够用）
+_STEP = 64 * 1024        # 每一步最多解压出的字节数
+
+
+class _Inflater:
+    """一层 gzip/deflate，按步限定输出。deflate 按首字节判断是 zlib 封装还是裸 deflate（与 httpx 的处理一致）。
+    gzip 只解第一个成员，之后的字节忽略（正常服务不会发多成员 gzip）。"""
+
+    def __init__(self, encoding: str) -> None:
+        self._gzip = encoding == "gzip"
+        self._d: Any = zlib.decompressobj(zlib.MAX_WBITS | 16) if self._gzip else None
+
+    def feed(self, data: bytes, room: int) -> Iterator[bytes]:
+        """解压 data，每步最多 _STEP 字节；累计输出超过 room 时，多产出至多 1 字节后停止（调用方据此判断超限）。"""
+        if self._d is None:
+            # zlib 封装：CMF 低 4 位为 8（deflate），且 (CMF*256+FLG) % 31 == 0
+            zlib_wrapped = len(data) >= 2 and (data[0] & 0x0F) == 8 and ((data[0] << 8) | data[1]) % 31 == 0
+            self._d = zlib.decompressobj() if zlib_wrapped else zlib.decompressobj(-zlib.MAX_WBITS)
+        d = self._d
+        buf = data
+        while buf and not d.eof:
+            out = d.decompress(buf, max(1, min(_STEP, room + 1)))
+            buf = d.unconsumed_tail
+            if out:
+                room -= len(out)
+                yield out
+                if room < 0:
+                    return
+            elif buf and not d.eof:
+                continue   # 没有输出但还有输入：继续（例如 gzip 头部）
+            else:
+                break
+
+    def flush(self, room: int) -> bytes:
+        if self._d is None or self._d.eof:
+            return b""
+        tail = self._d.flush()[: max(0, room + 1)]
+        if not self._d.eof:
+            # 流结束了但压缩数据没有结束（被截断或根本不是有效压缩数据）
+            raise zlib.error("incomplete compressed stream")
+        return tail
+
+
 async def read_limited(resp: httpx.Response, max_bytes: int, *, truncate: bool = False) -> bytes:
-    """读响应体，解压后最多 max_bytes。超过时：truncate=True 截断返回，否则抛 TooLarge。"""
-    decoder = resp._get_content_decoder()  # noqa: SLF001 - 按 Content-Encoding 选解码器（identity/gzip/deflate/br/zstd）
-    out = bytearray()
+    """读响应体，解压后最多 max_bytes。超过时：truncate=True 截断返回，否则抛 TooLarge。
+
+    - 只接受 identity、gzip、deflate 一层；其他或多层编码视为无效响应（请求里只声明了 gzip, deflate）。
+    - 解压每一步的输出都有上限，峰值内存约为 max_bytes + 64 KiB。
+    - 线缆字节最多 max_bytes × 4：压缩数据几乎不膨胀的异常流量也会被拦下。
+    """
     if hasattr(resp, "_content"):
         # 响应已经被完整读入（非流式构造，例如测试里的 Response(json=...)）：内容已解压，只做长度检查
         body = resp.content
@@ -120,21 +206,42 @@ async def read_limited(resp: httpx.Response, max_bytes: int, *, truncate: bool =
             return body[:max_bytes]
         return body
 
-    def take(chunk: bytes) -> bool:
-        room = max_bytes - len(out)
-        if len(chunk) > room:
-            if truncate:
-                out.extend(chunk[:room])
-                return False
+    encs = [e.strip().lower() for e in resp.headers.get("content-encoding", "").split(",") if e.strip()]
+    encs = [e for e in encs if e != "identity"]
+    if len(encs) > 1 or (encs and encs[0] not in ("gzip", "x-gzip", "deflate")):
+        raise SourceError(Outcome.UNKNOWN, f"不支持的内容编码：{', '.join(encs)}")
+    inflater = _Inflater("gzip" if encs and encs[0] in ("gzip", "x-gzip") else "deflate") if encs else None
+
+    out = bytearray()
+    wire = 0
+    wire_cap = max_bytes * WIRE_FACTOR + 64 * 1024
+
+    def full() -> bytes:
+        if not truncate:
             raise TooLarge
-        out.extend(chunk)
-        return True
+        return bytes(out[:max_bytes])
 
     async for raw in resp.aiter_raw():
-        for i in range(0, len(raw), _FEED):
-            if not take(decoder.decode(raw[i:i + _FEED])):
-                return bytes(out)
-    take(decoder.flush())
+        wire += len(raw)
+        if wire > wire_cap:
+            return full()
+        if inflater is None:
+            out.extend(raw[: max_bytes + 1 - len(out)])
+        else:
+            try:
+                for piece in inflater.feed(raw, max_bytes - len(out)):
+                    out.extend(piece)
+            except zlib.error:
+                raise SourceError(Outcome.UNKNOWN, "响应解压失败") from None
+        if len(out) > max_bytes:
+            return full()
+    if inflater is not None:
+        try:
+            out.extend(inflater.flush(max_bytes - len(out)))
+        except zlib.error:
+            raise SourceError(Outcome.UNKNOWN, "响应解压失败") from None
+        if len(out) > max_bytes:
+            return full()
     return bytes(out)
 
 
@@ -179,7 +286,7 @@ class Http:
             "timeout": httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0),
             "follow_redirects": False,
             "trust_env": False,          # F02：留空就是直连
-            "headers": {"User-Agent": USER_AGENT},
+            "headers": {"User-Agent": USER_AGENT, "Accept-Encoding": ACCEPT_ENCODING},
         }
         if transport is not None:
             kwargs["transport"] = transport

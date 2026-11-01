@@ -37,7 +37,7 @@ from .hub.sources import (BaiduProvider, BochaProvider, LangSearchProvider, Brav
                           SerperProvider)
 from .hub.reader import BuiltinReader, ReadChain, excerpt
 from .hub.image import ImageInputError, fetch_message_image, fetch_url_image, prepare_image
-from .hub.image_exec import ImageExecutor, make_image_plan
+from .hub.image_exec import ImageExecutor, make_image_plan, run_image_cpu
 from .hub.image_sources import AnimeTraceProvider, ContainerImageProvider, SauceNaoProvider, TraceMoeProvider
 from .hub.image_web import WEB_ENGINES
 from .hub import coexist
@@ -113,6 +113,7 @@ def _req_key(kwargs: dict[str, Any]) -> tuple:
             str(kwargs.get("selection_reason") or ""))
 
 
+REQ_PAIR_TTL = 300.0   # 一次请求从 before_request 到 after_response 的最长间隔（与授权有效期一致）
 _MODE_TEXT = {"hide": "隐藏", "observe": "观察", "off": "不处理"}
 SUBAGENT_TOOL = "subagent"
 # Host 1.3.18 SUBAGENT_FORBIDDEN_TOOL_NAMES：这些工具永远不会授权给子代理，出现任何一个就是主 Planner
@@ -174,7 +175,7 @@ def _owned(name: Any) -> bool:
         name.startswith(_RENAMED_PREFIX) and name[len(_RENAMED_PREFIX):] in OWNED_TOOLS))
 
 
-PLUGIN_VERSION = "0.5.5"
+PLUGIN_VERSION = "0.5.6"
 KEYED_SOURCES = ("langsearch", "bocha", "baidu", "qwen", "exa", "brave", "parallel", "linkup", "firecrawl", "serper", "perplexity")
 
 
@@ -241,8 +242,13 @@ def _key_fingerprints(cfg: HubConfig) -> dict[str, str]:
     s, im = cfg.sources, cfg.image
     keys = {n: getattr(s, n).api_key for n in KEYED_SOURCES}
     keys.update(keenable=s.keenable.api_key, tavily=s.tavily.api_key, tracemoe=im.tracemoe_key,
-                saucenao=im.saucenao_key)
+                saucenao=im.saucenao_key, container=im.container_key)
     return {n: hashlib.sha256(str(k or "").strip().encode()).hexdigest()[:16] for n, k in keys.items()}
+
+
+def _key_source(provider_name: str) -> str:
+    """Provider 名 → key 指纹里的来源名。容器引擎都共用容器 key（imgc_ 开头）。"""
+    return "container" if provider_name.startswith("imgc_") else provider_name
 
 
 class SearchHubPlugin(MaiBotPlugin):
@@ -286,6 +292,7 @@ class SearchHubPlugin(MaiBotPlugin):
         self.jobs: JobManager | None = None
         self._snapshot: Any = None
         self._key_fps: dict[str, str] = {}
+        self._key_gen: dict[str, int] = {}
         self._interrupt_told: set[str] = set()
         # before_request 记下本会话最近一次"带本插件工具的请求"来自谁，after_response 签发授权时使用。
         # 优先用请求指纹配对（_req_key）；配不上时退回"本会话最近一次"。判断出错的后果只是同步窗口和措辞用错一档，
@@ -293,9 +300,12 @@ class SearchHubPlugin(MaiBotPlugin):
         self._caller_hint: dict[str, str] = {}
         self._caller_by_req: dict[tuple, str] = {}
         # C（D46）：每个子代理任务最多搜索 N 次
-        self._task_by_req: dict[tuple, str] = {}
-        self._task_searches: dict[str, int] = {}
-        self._task_hint: dict[str, str] = {}                      # session -> 最近一次子代理任务（配对失败时的兜底）
+        # 0.5.6（S2）：Host 的 Hook 没有唯一请求 ID。同一键下出现多个任务（并行子代理）时记成候选集合；
+        # 配不上时退回本会话近期活跃的全部子代理任务。授权带上候选集合，按“任一候选到上限就拒绝、
+        # 每个候选都计一次”处理：宁可偶尔误拒，也不让上限被绕过。
+        self._task_by_req: dict[tuple, tuple[frozenset[str], float]] = {}   # 配对键 -> (候选任务, 最近登记时间)
+        self._task_searches: dict[str, tuple[int, float]] = {}   # "会话|任务" -> (次数, 最近一次时间)
+        self._task_seen: dict[str, dict[str, float]] = {}        # session -> {任务: 最近一次请求时间}
         self._last_prune = 0.0
         self._reader: ReadChain | None = None
         self._builtin: BuiltinReader | None = None
@@ -379,10 +389,12 @@ class SearchHubPlugin(MaiBotPlugin):
             return
         self._snapshot = snap
         # 0.5.3：哪个来源的 key 变了，就解除它的冷却（换了 key 不该再等 24 小时）
+        # 0.5.6（S5）：同时把该来源的 key 代次加一；之后旧代次请求晚到的鉴权失败不再给新 key 加冷却
         keys_now = _key_fingerprints(cfg)
         for name, fp in keys_now.items():
             if name in self._key_fps and self._key_fps[name] != fp:
-                self.health.reset(name)
+                self._key_gen[name] = self._key_gen.get(name, 0) + 1
+                self.health.reset(name, self._key_gen[name])
         self._key_fps = keys_now
         if self.ledger is not None:
             self.ledger.kv_set("key_fps", json.dumps(keys_now))
@@ -399,6 +411,10 @@ class SearchHubPlugin(MaiBotPlugin):
         install_log_filter()
         self._providers = build_providers(cfg, self._http, self.ctx)
         self._image_providers = build_image_providers(cfg, self._http)
+        for p in (*self._providers, *self._image_providers):
+            info = getattr(p, "info", None)
+            if info is not None:
+                info.extra["key_gen"] = self._key_gen.get(_key_source(info.name), 0)
         if self.ledger is not None:
             self.ledger.per_session = cfg.storage.per_session_entries
             keep = (cfg.storage.keep_days, cfg.storage.trace_keep_days)
@@ -431,6 +447,21 @@ class SearchHubPlugin(MaiBotPlugin):
         self.ledger.prune(cfg.storage.keep_days, cfg.storage.trace_keep_days)
         self._last_prune = time.time()
 
+    TASK_IDLE = 1800.0   # 子代理任务多久没有动静就视为结束（计数重来）
+
+    def _task_count(self, key: str, now: float) -> int:
+        n, last = self._task_searches.get(key, (0, 0.0))
+        return n if now - last <= self.TASK_IDLE else 0
+
+    def _recent_tasks(self, session_id: str) -> list[str]:
+        now = time.monotonic()
+        seen = self._task_seen.get(session_id, {})
+        for t in [t for t, at in seen.items() if now - at > self.TASK_IDLE]:
+            seen.pop(t, None)
+        if len(self._task_seen) > 256:
+            self._task_seen.pop(next(iter(self._task_seen)))
+        return list(seen)
+
     # ---------------- 授权（D21） ----------------
     @HookHandler("maisaka.planner.after_response", name="hub_grant", order="late")
     async def hub_grant(self, **kwargs: Any) -> dict:
@@ -444,8 +475,12 @@ class SearchHubPlugin(MaiBotPlugin):
         out = copy.deepcopy(items)
         key = _req_key(kwargs)
         caller = self._caller_by_req.pop(key, None) or self._caller_hint.get(str(session_id), "planner")
-        # F09：配不上时退回本会话最近一次子代理任务，不能静默变成“无任务”而绕过次数上限
-        task = (self._task_by_req.pop(key, "") or self._task_hint.get(str(session_id), "")) if caller == "subagent" else ""
+        # F09/S2：配不上时退回本会话近期活跃的全部子代理任务，不能静默变成“无任务”而绕过次数上限
+        task = ""
+        if caller == "subagent":
+            entry = self._task_by_req.pop(key, None)
+            cands = entry[0] if entry else frozenset(self._recent_tasks(str(session_id)))
+            task = "|".join(sorted(cands))
         for it in out:
             tc = it.get("tool_call") if isinstance(it, dict) else None
             if not isinstance(tc, dict) or not _owned(tc.get("func_name")):
@@ -478,8 +513,15 @@ class SearchHubPlugin(MaiBotPlugin):
             self._caller_by_req[_req_key(kwargs)] = caller
             if caller == "subagent":
                 task = _subagent_task_key(items)
-                self._task_by_req[_req_key(kwargs)] = task
-                self._task_hint[session_id] = task
+                if task:
+                    rk = _req_key(kwargs)
+                    now = time.monotonic()
+                    old = self._task_by_req.pop(rk, None)
+                    # 同一配对键上还没取走的候选：仍在授权有效期内的才合并（响应里没调用本插件工具时不会被取走）
+                    keep = old[0] if old and now - old[1] <= REQ_PAIR_TTL else frozenset()
+                    self._task_by_req[rk] = (keep | {task}, now)
+                    seen = self._task_seen.setdefault(session_id, {})
+                    seen[task] = now
             for d in (self._caller_by_req, self._task_by_req):
                 while len(d) > 256:
                     d.pop(next(iter(d)))
@@ -608,11 +650,17 @@ class SearchHubPlugin(MaiBotPlugin):
         if not cfg.plugin.enabled:
             return {"success": False, "error": "搜索中枢已停用"}
         # F09：子代理每个任务的搜索次数上限对文字和以图搜一起计（之前图片分支在检查前就返回了）
+        # 0.5.6（S2）：计数键带会话；任务 30 分钟没有动静就视为结束、重新计数；授权带多个候选任务时
+        # 任一候选到上限就拒绝，并给每个候选都计一次
         if grant.caller == "subagent" and grant.task:
-            used = self._task_searches.get(grant.task, 0)
-            if used >= cfg.search.subagent_max_searches:
-                return {"success": False, "error": cards.subagent_cap(used)}
-            self._task_searches[grant.task] = used + 1
+            now = time.monotonic()
+            keys = [f"{grant.session_id}|{t}" for t in grant.task.split("|") if t]
+            counts = [self._task_count(k, now) for k in keys]
+            if counts and max(counts) >= cfg.search.subagent_max_searches:
+                return {"success": False, "error": cards.subagent_cap(max(counts))}
+            for k, n in zip(keys, counts):
+                self._task_searches.pop(k, None)
+                self._task_searches[k] = (n + 1, now)
             while len(self._task_searches) > 512:
                 self._task_searches.pop(next(iter(self._task_searches)))
         self._maybe_prune()
@@ -700,7 +748,7 @@ class SearchHubPlugin(MaiBotPlugin):
                 raw = await fetch_url_image(self._builtin, image)
             else:
                 raw = await fetch_message_image(self.ctx, session_id, image, max(0, idx))
-            prepared = await asyncio.get_running_loop().run_in_executor(None, prepare_image, raw)
+            prepared = await run_image_cpu(prepare_image, raw)   # 0.5.6：与候选 dHash 共用专用线程池
         except ImageInputError as err:
             return {"success": False, "error": f"没能拿到图片：{err}。这不是搜索失败，请确认消息编号和图片序号。"}
         try:
@@ -830,10 +878,11 @@ class SearchHubPlugin(MaiBotPlugin):
                 "meta": {"item_id": EVIDENCE_ID, "logical_turn_id": None,
                          "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")},
                 "parts": [{"type": "text", "text": cards.evidence_block(entries)}]}
-        # 0.5.3：记下哪些结果进了回复模型的参考资料（used 计数此前没有调用方，生产中恒为 0，看不出引用率）
+        # 0.5.3：记下哪些结果进了回复模型的参考资料。0.5.6：口径是“曾经进过参考资料”（每条只记一次），
+        # 不是“回复里真的引用了”；读原文另计 reads（第二轮审查 6.1）
         shown = cards.evidence_entries(entries)
         try:
-            self.ledger.mark_used(session_id, [e["sn"] for e in shown])
+            self.ledger.mark_shown(session_id, [e["sn"] for e in shown])
         except Exception:  # noqa: BLE001 - 统计失败不影响回复
             pass
         new = [it for it in items if not (isinstance(it, dict) and isinstance(it.get("meta"), dict)

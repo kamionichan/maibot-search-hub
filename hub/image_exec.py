@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -89,7 +90,14 @@ def make_image_plan(providers: list[Any], health: Health, *, depth: str, intent:
     return ImagePlan(depth, intent, steps, image, skipped, primary=steps[:1])
 
 
-_DECODE_SLOTS = asyncio.Semaphore(2)
+# 0.5.6（S4）：解码并发上限由线程池本身保证（2 个工作线程）。之前用 asyncio 信号量包住 run_in_executor，
+# 协程被取消时槽位提前释放，后台线程却还在跑，并发会超过 2。专用线程池不受取消影响：线程跑完才空出来。
+_DECODE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hub-image")
+
+
+async def run_image_cpu(fn: Any, *args: Any) -> Any:
+    """图片相关的 CPU 活（输入清洗、候选 dHash）都走这个专用线程池，最多同时 2 个，不占 MaiBot 的默认线程池。"""
+    return await asyncio.get_running_loop().run_in_executor(_DECODE_POOL, fn, *args)
 
 
 class ImageExecutor:
@@ -125,7 +133,7 @@ class ImageExecutor:
                 got = await p.search_image(plan.image.jpeg, max_results=5 if many else 3)
             except SourceError as err:
                 a.outcome, a.note, a.seconds = err.outcome.value, err.message, time.monotonic() - a.started
-                self.health.failure(p.info.name, err)
+                self.health.failure(p.info.name, err, p.info.extra.get("key_gen"))
                 errors.append(err)
                 continue
             except asyncio.CancelledError:
@@ -133,16 +141,18 @@ class ImageExecutor:
             except Exception as exc:  # noqa: BLE001
                 err = SourceError(Outcome.UNKNOWN, type(exc).__name__)
                 a.outcome, a.note, a.seconds = "unknown", err.message, time.monotonic() - a.started
-                self.health.failure(p.info.name, err)
+                self.health.failure(p.info.name, err, p.info.extra.get("key_gen"))
                 errors.append(err)
                 continue
             a.seconds = time.monotonic() - a.started
             a.outcome, a.n = "ok", len(got)
             self.health.success(p.info.name, a.seconds)
             used.append(p.info.name)
+            # 0.5.6（S4）：先保存候选，再做验证。验证期间被取消或超时，已经拿到的候选仍在部分结果里
+            #（验证字段原地更新，没验证完的就是“未验证”）。
+            hits.extend(got)
             if got and self.reader is not None and (many or p.info.extra.get("verify_thumbs")):
                 await self._verify(plan.image.dhash, got, only_thumbs=not many)
-            hits.extend(got)
             best = _best_level(got)
             kinds_done.update(h.kind for h in got)
             if best == "hit" and plan.depth != "deep":
@@ -167,9 +177,8 @@ class ImageExecutor:
             except Exception:  # noqa: BLE001
                 h.extra["verify"] = "未验证"
                 return
-            # F12：解码放到线程池，并且全局最多同时解 2 张，不占事件循环
-            async with _DECODE_SLOTS:
-                dh = await asyncio.get_running_loop().run_in_executor(None, dhash_bytes, data)
+            # F12：解码放到专用线程池（最多 2 个线程），不占事件循环
+            dh = await run_image_cpu(dhash_bytes, data)
             if dh is None:
                 h.extra["verify"] = "未验证"
                 return

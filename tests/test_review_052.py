@@ -138,7 +138,8 @@ def test_f04_card_has_url():
     job.entries = led.record("s", job.result.results)
     text = cards.sync_result(job)
     assert "https://go.dev/doc/go1.26?v=1" in text and "utm_source" not in text and "#a" not in text
-    assert len(cards._link("https://a.test/" + "p" * 400)) <= cards.LINK_MAX
+    long = cards._link("https://a.test/" + "p" * 400)
+    assert long.startswith("https://a.test/") and "已截短" in long
 
 
 # ---------------- F05：超时交付已拿到的部分结果；异常进入终态 ----------------

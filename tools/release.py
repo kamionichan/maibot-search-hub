@@ -5,6 +5,7 @@
   .venv/bin/python tools/release.py stage <目录>      把发布文件复制到 <目录>（发布仓库的工作副本），
                                                      删除白名单以外的文件（保留 .git），再做一次隐私扫描
   .venv/bin/python tools/release.py notes [版本]      打印 CHANGELOG.md 里该版本的那一段（Release 说明用）
+  .venv/bin/python tools/release.py files            列出展开通配后的全部发布文件
 
 推送到 GitHub、打 Tag、建 Release 由人工完成（或以后的工作流），步骤见 docs/RELEASING.md。
 """
@@ -98,9 +99,15 @@ def check() -> list[str]:
     if not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+", repo):
         problems.append(f"manifest urls.repository 必须是公开 GitHub 地址（不带 .git）：{repo}")
     files = release_files()
-    missing = [f for f in files if not (ROOT / f).is_file()]
-    problems += [f"白名单里的 {f} 不存在" for f in missing]
-    payload = {f: (ROOT / f).read_bytes() for f in files if f not in missing}
+    tracked = build_zip.git_tracked(ROOT)
+    bad = []
+    for f in files:
+        try:
+            build_zip.check_file(ROOT, f, tracked)
+        except ValueError as e:
+            bad.append(f)
+            problems.append(f"白名单里的 {e}" if (ROOT / f).exists() or (ROOT / f).is_symlink() else f"白名单里的 {f} 不存在")
+    payload = {f: (ROOT / f).read_bytes() for f in files if f not in bad}
     problems += scan(payload)
     try:
         build_zip.check()
@@ -109,21 +116,44 @@ def check() -> list[str]:
     return problems
 
 
+def check_dest(dest: Path) -> Path:
+    """0.5.6（B3）：stage 会删掉目标目录里白名单以外的文件，目标必须是一个单独的发布仓库工作副本。
+    拒绝：开发仓库本身、它的子目录、它的上级目录（会把开发仓库当成“白名单外文件”删掉）、
+    符号链接、已存在但不是 git 工作副本的非空目录。"""
+    if dest.is_symlink():
+        raise SystemExit(f"目标目录不能是符号链接：{dest}")
+    real, root = dest.resolve(), ROOT.resolve()
+    if real == root or root in real.parents:
+        raise SystemExit("目标目录不能是开发仓库本身或它的子目录")
+    if real in root.parents:
+        raise SystemExit("目标目录不能是开发仓库的上级目录（会删掉开发仓库里的文件）")
+    if real.exists():
+        if not real.is_dir():
+            raise SystemExit(f"目标不是目录：{real}")
+        if any(real.iterdir()) and not (real / ".git").is_dir():
+            raise SystemExit(f"目标目录非空但不是 git 工作副本，拒绝清理：{real}")
+    return real
+
+
 def stage(dest: Path) -> None:
+    dest = check_dest(dest)
     problems = check()
     if problems:
         raise SystemExit("发布检查没通过，未复制任何文件：\n  " + "\n  ".join(problems))
     dest.mkdir(parents=True, exist_ok=True)
-    if dest.resolve() == ROOT.resolve() or ROOT.resolve() in dest.resolve().parents:
-        raise SystemExit("目标目录不能是开发仓库本身或它的子目录")
     files = set(release_files())
     # 先删掉发布仓库里不在白名单的文件（.git 和 .gitignore 除外），保证“只有白名单里的东西”
+    removed = []
     for p in sorted(dest.rglob("*"), reverse=True):
         rel = p.relative_to(dest).as_posix()
         if rel.split("/", 1)[0] in GENERATED:
             continue
-        if p.is_file() and rel not in files:
+        if p.is_symlink():
+            p.unlink()            # 不跟随链接
+            removed.append(rel)
+        elif p.is_file() and rel not in files:
             p.unlink()
+            removed.append(rel)
         elif p.is_dir() and not any(p.iterdir()):
             p.rmdir()
     for f in sorted(files):
@@ -135,6 +165,10 @@ def stage(dest: Path) -> None:
     if leftover:
         raise SystemExit("复制后的发布目录仍有私人信息：\n  " + "\n  ".join(leftover))
     print(f"已准备 {len(files)} 个文件到 {dest}（版本 {build_zip.version()}）")
+    for f in sorted(files):
+        print(f"  + {f}")
+    for f in removed:
+        print(f"  - {f}（不在白名单，已删除）")
 
 
 if __name__ == "__main__":
@@ -146,7 +180,9 @@ if __name__ == "__main__":
             raise SystemExit(1)
         print(f"OK：版本 {build_zip.version()}，发布文件 {len(release_files())} 个")
     elif cmd == "stage" and len(sys.argv) == 3:
-        stage(Path(sys.argv[2]).resolve())
+        stage(Path(sys.argv[2]).absolute())   # 不先 resolve：要能识别出符号链接
+    elif cmd == "files":
+        print("\n".join(release_files()))
     elif cmd == "notes":
         print(changelog_section(sys.argv[2] if len(sys.argv) > 2 else build_zip.version()))
     else:

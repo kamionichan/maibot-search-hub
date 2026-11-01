@@ -20,7 +20,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from .net import Outcome, SourceError, TooLarge, read_limited
+from .net import ACCEPT_ENCODING, Outcome, SourceError, TooLarge, read_limited
 
 Resolver = Callable[[str, int], Awaitable[Sequence[str]]]
 REDIRECTS = {301, 302, 303, 307, 308}
@@ -247,7 +247,7 @@ class BuiltinReader:
         try:
             async with self._client.stream(
                 "GET", req_url, headers={"Host": host_header, "User-Agent": UA, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
-                                         "Accept": accept_header},
+                                         "Accept": accept_header, "Accept-Encoding": ACCEPT_ENCODING},
                 follow_redirects=False, timeout=self._timeout, extensions=ext,
             ) as resp:
                 if resp.status_code in REDIRECTS:
