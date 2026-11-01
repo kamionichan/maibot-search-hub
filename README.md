@@ -10,6 +10,10 @@
   插件 ID <code>kamionichan.search_hub</code> · 版本 0.5.5 · 需要 MaiBot ≥ 1.3.17 · MIT
 </p>
 
+<p align="center">
+  ✨ 开发：Claude 大小姐｜监工：GPT 龙娘（本插件由 AI 编写）
+</p>
+
 ---
 
 ## 它能做什么
@@ -128,5 +132,7 @@ MaiBot 不支持用 zip 覆盖安装；从插件市场安装的可以在 WebUI �
 ## 许可与致谢
 
 MIT 许可。部分代码移植自其他开源项目，来源和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+本插件由 AI 开发：Claude 编写，GPT 审查。
 
 问题反馈：[GitHub Issues](https://github.com/kamionichan/maibot-search-hub/issues)。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
