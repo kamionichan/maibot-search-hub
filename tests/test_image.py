@@ -158,6 +158,23 @@ async def test_saucenao_mapping_hidden_filter_and_multipart():
     assert not hits[0].extra["thumbnail"] and hits[1].extra["thumbnail"].endswith("b.jpg")   # 只给疑似项做验证
 
 
+async def test_saucenao_allow_adult_keeps_and_labels_hidden():
+    """0.5.7：开启 allow_adult 时，标为隐藏的结果保留并标注成人向；关闭时过滤（见上一条）。"""
+    seen = {}
+
+    def h(req):
+        seen["url"] = str(req.url)
+        return httpx.Response(200, json=SAUCE_OK)
+
+    hits = await SauceNaoProvider(http_with(h), "k", allow_adult=True).search_image(b"x", max_results=5)
+    assert "hide=0" in seen["url"]
+    adult = [x for x in hits if "danbooru" in x.url]
+    assert adult and adult[0].nsfw and not any(x.nsfw for x in hits if x not in adult)
+    from hub.image_exec import _to_result
+    r = _to_result(adult, [], ["saucenao"], [])
+    assert "成人向" in r.results[0].snippet
+
+
 async def test_saucenao_errors():
     with pytest.raises(SourceError) as ei:
         await SauceNaoProvider(http_with(lambda r: httpx.Response(200, json={"header": {"status": -1, "message": "Invalid API key"}})), "k").search_image(b"x")
@@ -303,3 +320,12 @@ async def test_saucenao_likely_upgraded_only_when_thumbnail_matches():
     tags = {m.url: m.snippet.split("]")[0] for m in r.results}
     assert tags["https://www.pixiv.net/a"] == "[命中·出处·同图"
     assert tags["https://deviantart.com/b"] == "[疑似·出处·缩略图不符"
+
+
+def test_057_prompts():
+    """0.5.7：工具说明劝阻闲聊搜索；参考资料提示要求先用资料、允许引用原文。"""
+    from hub import cards
+    assert "闲聊" in cards.TOOL_DESCRIPTION and "原句" in cards.TOOL_DESCRIPTION
+    block = cards.evidence_block([{"sn": 1, "url": "https://a.test/", "title": "t", "snippet": "s",
+                                   "published_at": None, "last_seen": 0}])
+    assert "先把资料里的答案告诉对方" in block and "原文" in block

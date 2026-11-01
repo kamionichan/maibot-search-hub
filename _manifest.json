@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "0.5.6",
+  "version": "0.5.7",
   "name": "MaiBot 搜索中枢",
-  "description": "统一的搜索编排与对话衔接：自动组合多个搜索来源，长搜索转后台不占用聊天，结果带编号自然接回对话。",
+  "description": "文字搜索与以图搜图：自动组合多个搜索来源，截图可认番剧、角色和出处；长搜索转后台不占用聊天，结果带编号自然接回对话。",
   "author": {"name": "kamionichan", "url": "https://github.com/kamionichan"},
   "license": "MIT",
   "urls": {"repository": "https://github.com/kamionichan/maibot-search-hub", "issues": "https://github.com/kamionichan/maibot-search-hub/issues"},

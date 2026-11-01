@@ -232,7 +232,9 @@ class SauceNaoProvider:
                                             f"约 {d['est_time']} 处" if d.get("est_time") else "") if x)
             kind = "scene" if d.get("est_time") else "source"
             thumb = h.get("thumbnail") if level == "likely" and _valid_url(h.get("thumbnail")) else ""
+            # 0.5.7：开启 allow_adult 时保留 SauceNAO 标为隐藏的结果，并像 trace.moe 一样标注“成人向”
             out.append(ImageHit(_clip(title or _host(url), 80), url, snippet, kind, sim, level, self.info.name,
+                                nsfw=bool(h.get("hidden")),
                                 extra={"author": author, "index": h.get("index_id"), "thumbnail": thumb,
                                        "remaining": header.get("long_remaining")}))
             if len(out) >= max_results:

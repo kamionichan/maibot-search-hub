@@ -12,7 +12,7 @@ body:
     attributes:
       label: 版本
       description: 插件版本、MaiBot 版本（WebUI 插件管理页能看到）
-      placeholder: "插件 0.5.5，MaiBot 1.3.18"
+      placeholder: "插件 0.5.7，MaiBot 1.3.19"
     validations:
       required: true
   - type: textarea

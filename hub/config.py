@@ -199,7 +199,7 @@ class ImageSection(PluginConfigBase):
     """图片会先去掉拍摄信息等元数据、重新编码，再依次发给开启的服务，拿到确定结果就停。"""
     __ui_label__ = "以图搜图"
     enabled: bool = F(True, "启用以图搜图", "关闭后，聊天里的图片不会发给任何服务")
-    allow_adult: bool = F(False, "允许成人向结果", "关闭时过滤成人作品和 SauceNAO 标记为隐藏的结果")
+    allow_adult: bool = F(False, "允许成人向结果", "关闭时过滤 trace.moe 的成人作品和 SauceNAO 标为隐藏的结果；打开时保留并标注“成人向”")
     tracemoe_enabled: bool = F(True, "trace.moe：番剧截图", "哪部番、第几集、几分几秒。每天 100 次")
     tracemoe_key: str = F("", "trace.moe Key（可选）", "赞助者 Key，可以提高额度", secret=True)
     animetrace_enabled: bool = F(True, "AnimeTrace：角色识别", "动漫、游戏角色")
