@@ -279,8 +279,37 @@ class BuiltinReader:
         return ctype, data
 
 
+_GONE = re.compile(r"(?<!\d)(404|410)(?!\d)|not found|页面不存在|网页不存在|已删除|已被删除", re.I)
+# 别的读取服务的报错只认明确的状态码或“网页不存在”，避免把“服务未找到”之类当成网页不存在
+_GONE_STRICT = re.compile(r"(?<!\d)(404|410)(?!\d)|页面不存在|网页不存在")
+
+
+def read_failure_reason(err: BaseException | str) -> tuple[str, bool]:
+    """读取失败 → (给人看的原因, 是否“网页不存在”)。D72 补充：让模型能如实说明为什么读不到。"""
+    status = getattr(err, "status", None)
+    msg = getattr(err, "message", None) or str(err)
+    if status in (404, 410) or (status is None and _GONE.search(msg or "")):
+        return "网页不存在或已被删除（HTTP 404/410）", True
+    if status in (401, 403) or re.search(r"(?<!\d)(401|403)(?!\d)|拒绝|forbidden|denied", msg or "", re.I):
+        return "网站拒绝自动访问", False
+    if status == 429 or re.search(r"(?<!\d)429(?!\d)|频繁|rate", msg or "", re.I):
+        return "网站限制访问频率", False
+    if isinstance(err, asyncio.TimeoutError) or re.search(r"超时|timeout|连接失败|连不上", msg or "", re.I):
+        return "网站连不上或超时", False
+    if re.search(r"JavaScript", msg or ""):
+        return "网页要靠 JavaScript 显示内容，读不到正文", False
+    if re.search(r"公网|内网", msg or ""):
+        return "不是公网地址，已拒绝访问", False
+    return (msg or "读取失败")[:60], False
+
+
+class PageGone(SourceError):
+    """D72 补充：网页不存在（404/410）。换读取方式也读不到同一个网址，读取链到此为止。"""
+
+
 class ReadChain:
-    """D3：Host web.fetch → fetch-url API → 内置读取器。前一级不可用（未配置/未安装）时才往下走。"""
+    """D3：Host web.fetch → fetch-url API → 内置读取器。前一级不可用（未配置/未安装）时才往下走。
+    D72 补充：任何一级明确报告 404/410 时直接结束（换读取方式访问的还是同一个网址），并抛出 PageGone。"""
 
     FETCH_URL_API = "com.0-hz.fetch-url.fetch_url"
 
@@ -311,6 +340,8 @@ class ReadChain:
                 msg = str(exc)
                 if "未启用" in msg or "未配置" in msg or "能力" in msg:
                     self._host_off_until = now + 1800
+                elif _GONE_STRICT.search(msg):
+                    raise PageGone(Outcome.REJECTED, "网页不存在或已被删除（HTTP 404/410）", status=404) from None
                 errors.append("Host 读取不可用")
         if self._use_fetch_url and now >= self._fetch_url_off_until:
             try:
@@ -320,16 +351,25 @@ class ReadChain:
                     content = str(r.get("content") or "")
                     if r.get("success", True) and content.strip() and not content.startswith("抓取失败"):
                         return Page(url, str(r.get("title") or ""), content, "fetch_url")
+                    if _GONE_STRICT.search(str(r.get("error") or content)) and not content.strip()[200:]:
+                        raise PageGone(Outcome.REJECTED, "网页不存在或已被删除（HTTP 404/410）", status=404)
                     errors.append("fetch-url 未取到正文")
                 else:
                     err = str((res or {}).get("error") if isinstance(res, dict) else res)
                     if "未找到" in err or "不存在" in err or "解析失败" in err or "not found" in err.lower():
                         self._fetch_url_off_until = now + 1800
                     errors.append("fetch-url 不可用")
+            except PageGone:
+                raise
             except Exception:  # noqa: BLE001
                 self._fetch_url_off_until = now + 1800
                 errors.append("fetch-url 不可用")
-        return await self._builtin.fetch(url)
+        try:
+            return await self._builtin.fetch(url)
+        except SourceError as err:
+            if err.status in (404, 410):
+                raise PageGone(Outcome.REJECTED, "网页不存在或已被删除（HTTP 404/410）", status=err.status) from None
+            raise
 
 
 # ---------------- 摘录 ----------------

@@ -62,6 +62,10 @@ class Ledger:
         cols = {r[1] for r in self._db.execute("PRAGMA table_info(entries)")}
         if "reads" not in cols:   # 0.5.6：旧库补列
             self._db.execute("ALTER TABLE entries ADD COLUMN reads INTEGER DEFAULT 0")
+        if "verdict" not in cols:  # 0.6.0（D72）：最近一次核查的结论（direct/partial/stale/off/invalid）
+            self._db.execute("ALTER TABLE entries ADD COLUMN verdict TEXT")
+        if "review" not in {r[1] for r in self._db.execute("PRAGMA table_info(trace)")}:
+            self._db.execute("ALTER TABLE trace ADD COLUMN review TEXT")
         self.per_session = per_session
         self._seed_counters()
 
@@ -96,7 +100,8 @@ class Ledger:
                 row = cur.execute("SELECT sn, hits FROM entries WHERE session_id=? AND url_key=?",
                                   (session_id, m.key)).fetchone()
                 if row:
-                    cur.execute("UPDATE entries SET last_seen=?, hits=hits+1, title=COALESCE(NULLIF(?, ''), title),"
+                    # D72：同一网页换了问题再出现时，旧的核查结论不再适用
+                    cur.execute("UPDATE entries SET last_seen=?, hits=hits+1, verdict=NULL, title=COALESCE(NULLIF(?, ''), title),"
                                 " snippet=CASE WHEN length(?)>length(snippet) THEN ? ELSE snippet END,"
                                 " published_at=COALESCE(published_at, ?) WHERE session_id=? AND sn=?",
                                 (now, title, snippet, snippet, m.published_at, session_id, row[0]))
@@ -136,10 +141,10 @@ class Ledger:
                 "sources": json.loads(row[5] or "[]"), "first_seen": row[6]}
 
     def recent(self, session_id: str, since: float, limit: int = 6) -> list[dict[str, Any]]:
-        rows = self._db.execute("SELECT sn, url, title, snippet, published_at, last_seen FROM entries"
+        rows = self._db.execute("SELECT sn, url, title, snippet, published_at, last_seen, verdict FROM entries"
                                 " WHERE session_id=? AND last_seen>=? ORDER BY last_seen DESC, sn ASC LIMIT ?",
                                 (session_id, since, limit)).fetchall()
-        keys = ("sn", "url", "title", "snippet", "published_at", "last_seen")
+        keys = ("sn", "url", "title", "snippet", "published_at", "last_seen", "verdict")
         return [dict(zip(keys, r)) for r in rows]
 
     def parked(self, session_id: str, limit: int = 3) -> list[dict[str, Any]]:
@@ -155,6 +160,12 @@ class Ledger:
         ex = redact(excerpt_text)[:600]
         self._db.execute("UPDATE entries SET snippet=CASE WHEN length(?)>length(snippet) THEN ? ELSE snippet END,"
                          " reads=reads+1 WHERE session_id=? AND sn=?", (ex, ex, session_id, sn))
+
+    def set_verdicts(self, session_id: str, verdicts: dict[int, str]) -> None:
+        """D72：记下核查结论；回复参考资料据此跳过无关、无效的条目。"""
+        if verdicts:
+            self._db.executemany("UPDATE entries SET verdict=? WHERE session_id=? AND sn=?",
+                                 [(v or None, session_id, sn) for sn, v in verdicts.items()])
 
     def mark_shown(self, session_id: str, sns: list[int]) -> None:
         """进过回复参考资料：used 置 1（只记一次，同一窗口内多次注入不重复累计）。"""
@@ -229,11 +240,13 @@ class Ledger:
 
     # ---- 统计 / 轨迹 ----
     def trace(self, rec: dict[str, Any]) -> None:
-        self._db.execute("INSERT INTO trace VALUES (:job_id,:t,:session_id,:query,:depth,:intent,:caller,:outcome,"
-                         ":sync,:seconds,:attempts,:missing,:used_sns)",
+        self._db.execute("INSERT INTO trace (job_id, t, session_id, query, depth, intent, caller, outcome, sync, seconds,"
+                         " attempts, missing, used_sns, review) VALUES (:job_id,:t,:session_id,:query,:depth,:intent,"
+                         ":caller,:outcome,:sync,:seconds,:attempts,:missing,:used_sns,:review)",
                          {**rec, "attempts": json.dumps(rec.get("attempts") or [], ensure_ascii=False),
                           "missing": json.dumps(rec.get("missing") or []),
-                          "used_sns": json.dumps(rec.get("used_sns") or [])})
+                          "used_sns": json.dumps(rec.get("used_sns") or []),
+                          "review": json.dumps(rec["review"], ensure_ascii=False) if rec.get("review") else None})
 
     def get_trace(self, session_id: str, job_id: str) -> dict[str, Any] | None:
         row = self._db.execute("SELECT job_id, t, query, depth, intent, caller, outcome, sync, seconds, attempts, missing"

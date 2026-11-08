@@ -66,6 +66,8 @@ class SearchSection(PluginConfigBase):
     per_session_queue: int = F(2, "每个聊天排队等待的后台搜索（个）", "超出的搜索会被拒绝", ge=0, le=5)
     deep_width: int = F(3, "深度搜索同时查询的来源（个）", ge=2, le=5)
     deep_read_top: int = F(3, "深度搜索自动读取原文（篇）", "填 0 不读", ge=0, le=5)
+    normal_read_top: int = F(2, "普通搜索自动读取原文（篇）", "读排名靠前的几篇，只取和问题相关的段落；填 0 不读（D72）",
+                             ge=0, le=5)
     subagent_sync_window_seconds: float = F(20.0, "子代理转后台前等待（秒）", "子代理是麦麦派到后台独立做事的助手，它调用搜索时用这个等待时间",
                                             ge=1.0, le=50.0)
     subagent_max_searches: int = F(3, "子代理每个任务最多搜索（次）", "超过后提示它用已有结果总结，避免一个任务连搜十几次",
@@ -226,6 +228,19 @@ class ReadSection(PluginConfigBase):
     page_cache_minutes: float = F(15.0, "网页缓存时间（分钟）", "缓存期内再读同一网页不重新下载", ge=0.0, le=240.0)
 
 
+class VerifySection(PluginConfigBase):
+    """读完原文后，让模型判断每条结果是不是对方要的、时间对不对；没有结果真正回答问题时，如实告诉麦麦。
+    规则检查（乱码页面、明显过时、完全无关）始终进行，不调用模型。"""
+    __ui_label__ = "结果核查"
+    enabled: bool = F(True, "用模型核查搜索结果", "普通和深度搜索时，每次多调用一次下面的模型；快速搜索只做规则检查")
+    model_task: str = F("utils", "核查用的模型任务", "填麦麦「模型管理」里的任务名，建议用便宜、快的模型",
+                        placeholder="utils")
+    timeout_seconds: float = F(25.0, "核查超时（秒）", "超时只用规则检查的结果，不影响搜索。用推理模型时可能要调大", ge=3.0, le=60.0)
+    use_chat_context: bool = F(True, "麦麦没写搜索目的时，参考最近几条聊天",
+                               "麦麦写了“对方想弄清什么”时只用那一句；没写时才带上最近几条聊天。"
+                               "只交给上面的模型，不发给搜索服务；发言人只标“你/对方”")
+
+
 class ReplySection(PluginConfigBase):
     """把刚搜到的资料交给回复模型，让回答带上出处。"""
     __ui_label__ = "回复时带上出处"
@@ -264,6 +279,7 @@ class HubConfig(PluginConfigBase):
     qwen: QwenSection = Field(default_factory=QwenSection)
     image: ImageSection = Field(default_factory=ImageSection)
     read: ReadSection = Field(default_factory=ReadSection)
+    verify: VerifySection = Field(default_factory=VerifySection)
     reply: ReplySection = Field(default_factory=ReplySection)
     storage: StorageSection = Field(default_factory=StorageSection)
 
@@ -301,12 +317,12 @@ CONFIG_TABS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("free", "免费来源", ("keenable", "tavily", "host_web", "searxng")),
     ("keyed", "需要 Key 的来源", KEYED_SECTIONS),
     ("image", "以图搜图", ("image", "image_anime", "image_web", "image_container")),
-    ("advanced", "高级", ("search_tuning", "read", "reply", "storage")),
+    ("advanced", "高级", ("search_tuning", "read", "verify", "reply", "storage")),
 )
 
 
 TUNING_FIELDS = ("sync_window_seconds", "job_timeout_seconds", "stale_minutes", "per_session_running",
-                 "per_session_queue", "deep_width", "deep_read_top", "subagent_sync_window_seconds",
+                 "per_session_queue", "deep_width", "deep_read_top", "normal_read_top", "subagent_sync_window_seconds",
                  "subagent_max_searches")
 # 配置页上的虚拟配置节：(虚拟节 id, 实际 TOML 节, 标题, 说明, 字段)。字段按两列排，相关的两项放在同一行。
 VIRTUAL_SECTIONS: tuple[tuple[str, str, str, str, tuple[str, ...]], ...] = (

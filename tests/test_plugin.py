@@ -312,7 +312,7 @@ async def test_result_cache_hit_returns_without_calling(plug):
 
 
 async def test_deep_enrich_reads_top_results(plug):
-    plug._reader = FakeChain(text="无关段落\n缓存 测试 的正文：这里有具体细节 9月23日\n结尾")
+    plug._reader = FakeChain(text="无关段落" * 20 + "\n缓存 测试 的正文：这里有具体细节 9月23日\n结尾" + "其他内容" * 20)
     plug.config.search.deep_read_top = 2
     res = await plug.search(**await _grant(plug, args={"query": "缓存 测试", "depth": "deep"}))
     assert res["success"] and "（已读正文）" in res["content"] and "9月23日" in res["content"]

@@ -43,6 +43,9 @@ class Job:
     cached_at: float | None = None    # 命中结果缓存时为原检索时间
     cache_key: str = ""
     image_hash: str = ""              # 以图搜：清洗后图片的 sha1（不保存图片本身）
+    goal: str = ""                    # D72：模型写的“对方想弄清什么”（只给核查模型，不发给搜索服务）
+    chat: str = ""                    # D72：发起搜索时最近几条聊天（同上）
+    review: Any = None                # D72：verify.Review（读正文后的核查结论）
 
     def row(self) -> dict[str, Any]:
         return {
@@ -82,7 +85,7 @@ class JobManager:
         self.deliver: Deliver | None = None
         # 第 3 阶段：deep 档完成后读取前几条正文（enrich）；每个任务结束后的回调（持久化健康统计等）
         self.enrich: Callable[[Job], Awaitable[None]] | None = None
-        self.enrich_timeout = 20.0
+        self.enrich_timeout = 45.0      # 安全上限：读正文与模型核查各自另有时限（D72）
         self.on_finished: Callable[[Job], None] | None = None
         self._bg: set[asyncio.Task] = set()
         self._tails: set[asyncio.Task] = set()
@@ -170,7 +173,8 @@ class JobManager:
                     self._adopt_tails(executor)
             if job.result and job.result.results:
                 job.entries = self.ledger.record(job.session_id, job.result.results)
-                if self.enrich is not None and job.depth == "deep" and job.status == "finished":
+                # D72：所有文字搜索都核查（quick 只做规则，不读正文）；以图搜不走这里
+                if self.enrich is not None and job.status == "finished" and not job.image_hash:
                     try:
                         await asyncio.wait_for(self.enrich(job), timeout=self.enrich_timeout)
                     except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - 读正文失败不影响搜索结果
@@ -204,6 +208,7 @@ class JobManager:
                     "sync": None, "seconds": round(time.monotonic() - t0, 2),
                     "attempts": attempts_summary(job.result.attempts) if job.result else [],
                     "missing": job.result.missing if job.result else [], "used_sns": [],
+                    "review": job.review.summary() if job.review is not None else None,
                 })
         if self.on_finished is not None:
             try:

@@ -35,12 +35,13 @@ from .hub.providers import HostWebProvider, KeenableProvider, TavilyProvider
 from .hub.sources import (BaiduProvider, BochaProvider, LangSearchProvider, BraveProvider, ExaProvider, FirecrawlProvider,
                           LinkupProvider, ParallelProvider, PerplexityProvider, QwenSearchProvider, SearxngProvider,
                           SerperProvider)
-from .hub.reader import BuiltinReader, ReadChain, excerpt
+from .hub.reader import BuiltinReader, ReadChain, excerpt, read_failure_reason
 from .hub.image import ImageInputError, fetch_message_image, fetch_url_image, prepare_image
 from .hub.image_exec import ImageExecutor, make_image_plan, run_image_cpu
 from .hub.image_sources import AnimeTraceProvider, ContainerImageProvider, SauceNaoProvider, TraceMoeProvider
 from .hub.image_web import WEB_ENGINES
 from .hub import coexist
+from .hub import verify
 
 TOOL = "search"
 READ_TOOL = "read_source"
@@ -175,7 +176,7 @@ def _owned(name: Any) -> bool:
         name.startswith(_RENAMED_PREFIX) and name[len(_RENAMED_PREFIX):] in OWNED_TOOLS))
 
 
-PLUGIN_VERSION = "0.5.7"
+PLUGIN_VERSION = "0.6.0"
 KEYED_SOURCES = ("langsearch", "bocha", "baidu", "qwen", "exa", "brave", "parallel", "linkup", "firecrawl", "serper", "perplexity")
 
 
@@ -322,6 +323,7 @@ class SearchHubPlugin(MaiBotPlugin):
         self._turn_marks: dict[str, str] = {}
         self._page_cache: dict[str, tuple[float, Any]] = {}      # url -> (时间, Page)
         self._reads: dict[str, tuple[str, int]] = {}              # session -> (最新真人消息指纹, 次数)
+        self._chat_ctx: dict[str, str] = {}                        # session -> 最近几条聊天（D72，只给核查模型）
         # 同一会话短时间内的搜索次数（不分来源），用于提示"结果够了就直接回答"
         self._recent: dict[str, list[float]] = {}
         # 防循环（第 1 阶段实测发现）：结果卡触发的那一轮里最多追加 1 次搜索，之后必须先回答
@@ -527,6 +529,10 @@ class SearchHubPlugin(MaiBotPlugin):
                     d.pop(next(iter(d)))
             if caller == "planner":
                 self._turn_marks[session_id] = _human_turn_mark(items)
+                # D72：最近几条聊天，只交给核查模型（不发给搜索服务）
+                self._chat_ctx[session_id] = verify.chat_context(items)
+                while len(self._chat_ctx) > 256:
+                    self._chat_ctx.pop(next(iter(self._chat_ctx)))
                 card = _card_triggered(items)
                 self._card_turn[session_id] = card
                 if not card:
@@ -628,6 +634,9 @@ class SearchHubPlugin(MaiBotPlugin):
                                            "identify_character 这是哪个角色 / identify_person 照片里的人 / similar_image 相似图片")),
             ToolParameterInfo(name="freshness", param_type=ToolParamType.STRING, required=False, default="any",
                               enum_values=["any", "recent", "today"], description="是否要求最近的内容"),
+            ToolParameterInfo(name="goal", param_type=ToolParamType.STRING, required=False, default="",
+                              description=("可选：一句话写对方想弄清什么，例如“群友问 EDG 最近是不是要解散”。"
+                                           "只用于核查结果是否答到点上，不会发给搜索服务")),
             ToolParameterInfo(name="provider", param_type=ToolParamType.STRING, required=False, default="",
                               description=("可选：点名来源（keenable / tavily / searxng / bocha / baidu / qwen / exa / brave / "
                                            "parallel / linkup / firecrawl / serper / perplexity / host_web）。"
@@ -637,7 +646,8 @@ class SearchHubPlugin(MaiBotPlugin):
         timeout_ms=60000,
     )
     async def search(self, query: str = "", depth: str = "normal", intent: str = "auto", freshness: str = "any",
-                     provider: str = "", image: str = "", image_index: Any = 0, **kwargs: Any) -> dict:
+                     provider: str = "", image: str = "", image_index: Any = 0, goal: str = "", **kwargs: Any) -> dict:
+        kwargs["_goal"] = str(goal or "").strip()[:200]
         res = await self._search_impl(query, depth, intent, freshness, provider, image, image_index, **kwargs)
         return self._fix_names(res)
 
@@ -678,6 +688,7 @@ class SearchHubPlugin(MaiBotPlugin):
         freshness = freshness if freshness in ("any", "recent", "today") else "any"
         if intent == "news" and freshness == "any":
             freshness = "recent"
+        goal = str(kwargs.pop("_goal", "") or "")
         assert self.jobs and self.ledger
         session_id = grant.session_id
         window = cfg.search.subagent_sync_window_seconds if grant.caller == "subagent" else cfg.search.sync_window_seconds
@@ -703,6 +714,8 @@ class SearchHubPlugin(MaiBotPlugin):
                 job = Job(self.ledger.next_job_id(), session_id, query, depth, intent, freshness, grant.caller,
                           norm_query=nq, status="finished", owner="sync", cached_at=hit[0], result=hit[1])
                 job.entries = self.ledger.record(session_id, hit[1].results)
+                job.goal = goal
+                self._rule_review(job)       # D72：缓存命中不再读正文、不调模型，只做规则核查
                 self.ledger.save_job(job.row())
                 self.ledger.mark_delivered(job.job_id, 1)
                 return {"success": True, "content": cards.sync_result(job, burst=self._count_recent(session_id))}
@@ -714,6 +727,8 @@ class SearchHubPlugin(MaiBotPlugin):
         except SourceError as err:
             return {"success": False, "error": f"搜索未能发出：{err.message}。这不代表网上没有相关内容。"}
         job = Job(self.ledger.next_job_id(), session_id, query, depth, intent, freshness, grant.caller, norm_query=nq)
+        job.goal = goal
+        job.chat = self._chat_ctx.get(session_id, "") if grant.caller == "planner" else ""
         job.cache_key = cache_key if cfg.search.cache_enabled and not provider else ""
         executor = Executor(self.health, cfg.search.max_results_per_source, budget=self.budget)
         await self.jobs.start(job, plan, executor, window)
@@ -851,10 +866,8 @@ class SearchHubPlugin(MaiBotPlugin):
                 self._page_cache[url] = (time.time(), page)
                 while len(self._page_cache) > 64:
                     self._page_cache.pop(next(iter(self._page_cache)))
-        except SourceError as err:
-            return {"success": False, "error": cards.page_failure(ref, err.message)}
-        except asyncio.TimeoutError:
-            return {"success": False, "error": cards.page_failure(ref, "读取超时")}
+        except (SourceError, asyncio.TimeoutError) as err:
+            return {"success": False, "error": cards.page_failure(ref, read_failure_reason(err)[0])}
         text, truncated = excerpt(page.text, str(focus or ""), cfg.read.excerpt_chars)
         if sn is not None:
             self.ledger.set_page(grant.session_id, sn, text)
@@ -923,31 +936,135 @@ class SearchHubPlugin(MaiBotPlugin):
         self.ledger.kv_set("health", self.health.dump())
 
     async def _enrich(self, job: Job) -> None:
-        """deep 档：读取前 N 条结果的正文，把与问题相关的段落换进摘要（D33 读取前 3 条正文）。"""
-        cfg: HubConfig = self.config  # type: ignore[assignment]
-        n = cfg.search.deep_read_top
-        # F06：与 read_source 同一套许可——关了“读取网页原文”或文字外发，deep 档也不读正文
-        if (n <= 0 or not self._reader or not self.ledger or not cfg.read.enabled
-                or not cfg.search.allow_text_outbound or job.image_hash):
-            return
-        targets = [e for e in job.entries[: n + 2] if not e.read][:n]
+        """D72：读正文 + 结果核查。
 
-        async def one(e: Any) -> None:
+        - 读正文：deep 读前 deep_read_top 篇，normal 读前 normal_read_top 篇，quick 不读；只取与问题相关的段落换进摘要。
+        - 规则核查：所有档位（不调模型）。
+        - 模型核查：normal、deep，且开启了 [verify]；失败或超时只用规则结果。
+        F06：读取与 read_source 同一套许可——关了“读取网页原文”或文字外发，就不读正文（规则核查照常做）。
+        """
+        cfg: HubConfig = self.config  # type: ignore[assignment]
+        if not self.ledger or job.image_hash:
+            return
+        n = {"deep": cfg.search.deep_read_top, "normal": cfg.search.normal_read_top}.get(job.depth, 0)
+        may_read = bool(self._reader) and cfg.read.enabled and cfg.search.allow_text_outbound
+        bodies: dict[int, str] = {}
+        failed: dict[int, str] = {}         # sn -> 读取失败原因（只记“网页不存在”这种确定的）
+        reads: dict[int, str] = {}          # sn -> ok / 失败原因（全部尝试，记进调用记录）
+        shown = job.entries[: (8 if job.depth == "deep" else 5)]
+        if n > 0 and may_read:
+            await self._read_top(job, shown, n, bodies, failed, reads)
+
+        need = verify.time_need(job.query, job.goal, job.freshness, job.intent)
+        rule = {e.sn: verify.rule_check(job.query, need, title=e.title, snippet=e.snippet, body=bodies.get(e.sn),
+                                        published_at=e.published_at) for e in shown}
+        for sn, why in failed.items():
+            rule[sn] = verify.Check(verify.INVALID, why, "rule")
+        review = verify.Review(checks=rule, reads=reads)
+        if job.depth in ("normal", "deep") and cfg.verify.enabled and shown:
+            gen = getattr(getattr(self.ctx, "llm", None), "generate", None)
+            if gen is None:
+                review.model_error = "Host 没有提供模型能力"
+            else:
+                items = []
+                for e in shown:
+                    if rule[e.sn].verdict == verify.INVALID:
+                        continue
+                    date = e.published_at[:10] if e.published_at else rule[e.sn].page_date
+                    items.append((e.sn, e.title, cards._domain(e.url), date, e.snippet))
+                if items:
+                    # D73：模型填了 goal 就只用它；没填时才带最近几条聊天兜底
+                    chat = job.chat if cfg.verify.use_chat_context and not job.goal else ""
+                    prompt = verify.build_prompt(job.query, job.goal, chat,
+                                                 need, time.strftime("%Y-%m-%d"), items)
+                    try:
+                        model, gap = await verify.model_check(gen, prompt, {i[0] for i in items},
+                                                              task=cfg.verify.model_task.strip() or "utils",
+                                                              timeout=cfg.verify.timeout_seconds)
+                        review.checks = verify.merge_checks(rule, model)
+                        review.gap, review.by_model = gap, True
+                    except Exception as exc:  # noqa: BLE001 - 核查失败只用规则结果
+                        review.model_error = (str(exc) or type(exc).__name__)[:80]
+                        self.ctx.logger.warning(f"结果核查未完成，只用规则检查：{review.model_error}")
+        job.review = review
+        try:
+            self.ledger.set_verdicts(job.session_id, {sn: c.verdict for sn, c in review.checks.items()})
+        except Exception:  # noqa: BLE001
+            pass
+
+    READ_EXTRA = 2          # D72 补充：读不到时最多再换几条结果
+    READ_BUDGET = 20.0      # 自动读原文的总时限（秒）
+
+    async def _read_top(self, job: Job, shown: list[Any], n: int, bodies: dict[int, str], failed: dict[int, str],
+                        reads: dict[int, str] | None = None) -> None:
+        """按排名读原文，凑够 n 篇能用的：某条读不到（网页不存在、要登录、没正文、连不上）就换下一条，
+        最多多试 READ_EXTRA 条；总时间超过 READ_BUDGET 就停，读到几篇用几篇。标题乱码的条目不去读。"""
+        cfg: HubConfig = self.config  # type: ignore[assignment]
+        focus = f"{job.query} {job.goal}".strip()
+        reads = reads if reads is not None else {}
+        pool = [e for e in shown if not e.read and not verify.invalid_reason(e.title, e.snippet, None)]
+        tries_left = n + self.READ_EXTRA
+        good = 0
+
+        async def one(e: Any) -> bool:
             cached = self._page_cache.get(e.url)
             try:
                 if cached and time.time() - cached[0] < cfg.read.page_cache_minutes * 60:
                     page = cached[1]
                 else:
-                    page = await asyncio.wait_for(self._reader.read(e.url), timeout=15)
+                    page = await asyncio.wait_for(self._reader.read(e.url), timeout=min(15.0, cfg.read.timeout_seconds))
                     self._page_cache[e.url] = (time.time(), page)
-            except (SourceError, asyncio.TimeoutError, Exception):  # noqa: BLE001
-                return
-            text, _ = excerpt(page.text, job.query, 500)
+                    while len(self._page_cache) > 64:
+                        self._page_cache.pop(next(iter(self._page_cache)))
+            except Exception as exc:  # noqa: BLE001 - 读不到保留摘要，换下一条
+                why, gone = read_failure_reason(exc)
+                reads[e.sn] = why
+                if gone:
+                    failed[e.sn] = why
+                return False
+            bodies[e.sn] = page.text
+            bad = verify.invalid_reason(e.title, e.snippet, page.text)
+            reads[e.sn] = bad or "ok"
+            if bad:
+                return False
+            text, _ = excerpt(page.text, focus, 500)
             if len(text) > len(e.snippet):
                 e.snippet, e.read = text, True
                 self.ledger.set_page(job.session_id, e.sn, text)
+            return True
 
-        await asyncio.gather(*(one(e) for e in targets))
+        async def run() -> None:
+            nonlocal tries_left, good
+            running: set[asyncio.Task] = set()
+            while good < n and (pool or running):
+                while pool and tries_left > 0 and len(running) < n - good:
+                    tries_left -= 1
+                    running.add(asyncio.create_task(one(pool.pop(0))))
+                if not running:
+                    break
+                done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                good += sum(1 for t in done if not t.cancelled() and t.exception() is None and t.result())
+            for t in running:
+                t.cancel()
+
+        try:
+            await asyncio.wait_for(run(), timeout=self.READ_BUDGET)
+        except asyncio.TimeoutError:
+            pass
+
+    def _rule_review(self, job: Job) -> None:
+        """只做规则核查（缓存命中时用）。"""
+        if not self.ledger or not job.entries:
+            return
+        need = verify.time_need(job.query, job.goal, job.freshness, job.intent)
+        shown = job.entries[: (8 if job.depth == "deep" else 5)]
+        job.review = verify.Review(checks={e.sn: verify.rule_check(job.query, need, title=e.title, snippet=e.snippet,
+                                                                   body=None, published_at=e.published_at)
+                                           for e in shown})
+        try:
+            self.ledger.set_verdicts(job.session_id, {sn: c.verdict for sn, c in job.review.checks.items()})
+        except Exception:  # noqa: BLE001
+            pass
 
     def _count_recent(self, session_id: str, window: float = 120.0) -> int:
         now = time.monotonic()
