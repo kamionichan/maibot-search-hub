@@ -152,29 +152,18 @@ def test_b2_sources_do_not_clip_before_error():
         assert not re.search(r"SourceError\(Outcome\.[A-Z_]+,\s*_clip\(", src), f
 
 
-def test_b2_result_card_redacts_key_and_credential_params():
+def test_d83_search_content_kept_verbatim():
+    """0.6.1（D83，用户决定）：搜到的公开内容不改写——网址里的 key=value 示例、正文里像 key 的字符串都原样保留。
+    报错文字和日志仍然脱敏（见 test_b2_redact_before_clip、test_b2_log_filter_redacts_exception_text）。"""
     set_secrets(["SECRETKEY-abcdef"])
     led = Ledger(None)
-    m = rrf_merge([("a", "a", 1, [Hit("title SECRETKEY-abcdef", "https://a.test/p?token=zzz9&x=1",
-                                      "snippet SECRETKEY-abcdef")])])
+    m = rrf_merge([("a", "a", 1, [Hit("title key=value 示例", "https://a.test/p?key=value&x=1", "snippet")])])
     j = Job("J1", "s", "q", "quick", "auto", "any", "planner")
     j.result = RunResult(m, [], [], ["keenable"])
     j.entries = led.record("s", m)
     out = cards.sync_result(j)
-    assert "SECRETKEY-abcdef" not in out
-    ev = cards.evidence_block(led.recent("s", 0))
-    assert "SECRETKEY-abcdef" not in ev and "zzz9" not in ev
-    # 账本里的网址保持原样（读原文要用），展示时去掉凭据参数
-    assert led.get("s", 1)["url"].endswith("token=zzz9&x=1")
-    assert "zzz9" not in cards._link("https://a.test/p?token=zzz9&x=1")
-    assert "x=1" in cards._link("https://a.test/p?token=zzz9&x=1")
-
-
-def test_b2_page_result_redacted():
-    set_secrets(["SECRETKEY-abcdef"])
-    out = cards.page_result("S1", 1, "t SECRETKEY-abcdef", "https://a.test/?key=SECRETKEY-abcdef",
-                            "body SECRETKEY-abcdef", False, "builtin")
-    assert "SECRETKEY-abcdef" not in out
+    assert "key=value" in out and "?key=value&x=1" in out
+    assert cards._link("https://a.test/p?utm_source=x&key=value") == "https://a.test/p?key=value"   # 跟踪参数仍去掉
 
 
 def test_b2_log_filter_redacts_exception_text():
@@ -374,8 +363,8 @@ async def test_s2_stale_pairing_entry_is_replaced(plug):
     import plugin as P
     await _ctx(plug, "s", "任务A")
     rk = next(iter(plug._task_by_req))
-    cands, at = plug._task_by_req[rk]
-    plug._task_by_req[rk] = (cands, at - P.REQ_PAIR_TTL - 1)
+    cands, at, pending = plug._task_by_req[rk]
+    plug._task_by_req[rk] = (cands, at - P.REQ_PAIR_TTL - 1, pending)
     await _ctx(plug, "s", "任务B")
     assert len(plug._task_by_req[rk][0]) == 1
 
@@ -527,7 +516,7 @@ async def test_s5_plugin_tags_providers_with_key_generation(plug):
     plug._apply_config()
     g1 = next(p.info.extra["key_gen"] for p in plug._providers if p.info.name == "keenable")
     assert g1 == g0 + 1
-    assert "container" in P._key_fingerprints(cfg)
+    assert "container" not in P._key_fingerprints(cfg) and "serpapi_lens" in P._key_fingerprints(cfg)
 
 
 # ---------------- S6：预算跳过不算失败（重写 0.5.3 那条没跑到被测分支的测试） ----------------
@@ -558,3 +547,17 @@ def test_s6_exa_default_fits_monthly_free_credit():
     # Auto 搜索 $7/千次，每月 $10 ≈ 1428 次；31 天都按上限用也不能超
     assert DEFAULT_DAILY["exa"] * 31 <= 10 / 7 * 1000
     assert HubConfig().sources.exa.daily_limit == DEFAULT_DAILY["exa"]
+
+
+
+async def test_r61_21_late_response_after_pop_still_counts_for_a(plug):
+    """R61-21：A、B 同一配对键在途；B 先响应，C 随后登记同键；A 的响应晚到。0.6.0：A 的第 4 次搜索只记给 C。"""
+    for i in range(3):
+        await _ctx(plug, "s", "任务A")
+        assert (await _grant_and_search(plug, "s", f"a{i}"))["success"]
+    await _ctx(plug, "s", "任务A")
+    await _ctx(plug, "s", "任务B")
+    out = await plug.hub_grant(output_items=[], session_id="s", **SUB)       # B 的响应：没调用本插件工具
+    await _ctx(plug, "s", "任务C")
+    res = await _grant_and_search(plug, "s", "a3")                           # A 晚到
+    assert not res["success"] and "上限" in res["error"]

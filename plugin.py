@@ -24,12 +24,12 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 from .hub import cards
 from .hub.config import HubConfig, decorate_schema, migrate_config, mode_value
 from .hub.executor import Executor, RunResult, make_plan
-from .hub.merge import Merged
+from .hub.merge import Merged, _terms
 from .hub.grants import GRANT_FIELD, IDENTITY_FIELDS, GrantBook
 from .hub.health import Health
 from .hub.jobs import Job, JobManager
 from .hub.ledger import Ledger
-from .hub.net import Http, SourceError, install_log_filter, set_secrets
+from .hub.net import Http, SourceError, install_log_filter, redact, set_secrets
 from .hub.budget import Budget
 from .hub.providers import HostWebProvider, KeenableProvider, TavilyProvider
 from .hub.sources import (BaiduProvider, BochaProvider, LangSearchProvider, BraveProvider, ExaProvider, FirecrawlProvider,
@@ -38,8 +38,11 @@ from .hub.sources import (BaiduProvider, BochaProvider, LangSearchProvider, Brav
 from .hub.reader import BuiltinReader, ReadChain, excerpt, read_failure_reason
 from .hub.image import ImageInputError, fetch_message_image, fetch_url_image, prepare_image
 from .hub.image_exec import ImageExecutor, make_image_plan, run_image_cpu
-from .hub.image_sources import AnimeTraceProvider, ContainerImageProvider, SauceNaoProvider, TraceMoeProvider
+from .hub.image_sources import AnimeTraceProvider, SauceNaoProvider, TraceMoeProvider
 from .hub.image_web import WEB_ENGINES
+from .hub.image_more import BaiduImageProvider, CamofoxLensProvider, SerpApiLensProvider
+from .hub import pace
+from .hub import image_find
 from .hub import coexist
 from .hub import verify
 
@@ -51,7 +54,8 @@ PROGRESS_ID = "kamionichan.search_hub:progress"
 DEPTHS = ("quick", "normal", "deep")
 TEXT_INTENTS = ("auto", "facts", "news", "howto", "discussion", "quote_origin")
 IMAGE_INTENTS = ("image_source", "identify_scene", "identify_character", "identify_person", "similar_image")
-INTENTS = TEXT_INTENTS + IMAGE_INTENTS
+FIND_INTENT = "find_image"          # D81：按关键词找图发给对方
+INTENTS = TEXT_INTENTS + (FIND_INTENT,) + IMAGE_INTENTS
 
 
 def _warm_jieba() -> None:
@@ -154,6 +158,44 @@ def _norm_query(q: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", q).lower().split())
 
 
+_YEAR_RE = re.compile(r"(?<!\d)20\d{2}(?:\s*年)?(?!\d)")
+
+
+def _similar_query(running: str, new: str) -> bool:
+    """D80 / R61-07：新查询去掉年份后，**没有比后台那次多出任何新词**才算同一个问题（例如只加了“2024”、调换词序）。
+    多了新词就放行（battery 换成 screen 是不同问题）。代价：换了同义词会多搜一次。"""
+    ta, tb = _query_words(running), _query_words(new)
+    if not ta or not tb:
+        return False
+    return tb <= ta
+
+
+def _covers(new: str, old: str, focus: str) -> bool:
+    """R63-01：别用一段更长但一个关注词都没命中的文字，盖掉原来对题的摘要。正文常换说法（摘要“分裂”、
+    正文“重组”），所以只要摘录里还有关注词就照样替换；只有“摘要命中、摘录一个都没命中”时保留摘要。"""
+    terms = {t for t in re.split(r"[\s,，、；;]+", (focus or "").lower()) if len(t) > 1}
+    if not terms:
+        return True
+    lo, ln = old.lower(), new.lower()
+    return any(t in ln for t in terms) or not any(t in lo for t in terms)
+
+
+def _query_words(q: str) -> set[str]:
+    """比较用的词集合：英文按词，中文用分词结果里两字以上的词；没有分词器时（jieba 未装）用相邻两字，
+    避免退化成单字后“换了词也算子集”。"""
+    q = _YEAR_RE.sub(" ", unicodedata.normalize("NFKC", q).lower())
+    # R62-06：单个字母或数字也是词（“C 语言”“R 语言”“4 代”），不能丢
+    words = set(re.findall(r"[a-z0-9.+#]+", q))
+    han = re.findall(r"[\u4e00-\u9fff]+", q)
+    segs = [w for w in _terms(" ".join(han)) if re.fullmatch(r"[\u4e00-\u9fff]+", w)]
+    if segs and any(len(w) > 1 for w in segs):
+        words |= {w for w in segs if len(w) > 1}
+    else:
+        for run in han:
+            words |= {run[i:i + 2] for i in range(len(run) - 1)} or {run}
+    return words
+
+
 def _fn_name(tool_def: Any) -> str:
     if isinstance(tool_def, dict):
         fn = tool_def.get("function") if isinstance(tool_def.get("function"), dict) else tool_def
@@ -176,7 +218,7 @@ def _owned(name: Any) -> bool:
         name.startswith(_RENAMED_PREFIX) and name[len(_RENAMED_PREFIX):] in OWNED_TOOLS))
 
 
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.1"
 KEYED_SOURCES = ("langsearch", "bocha", "baidu", "qwen", "exa", "brave", "parallel", "linkup", "firecrawl", "serper", "perplexity")
 
 
@@ -220,13 +262,29 @@ def build_image_providers(cfg: HubConfig, http: Http) -> list[Any]:
         ps.append(SauceNaoProvider(http, im.saucenao_key, allow_adult=im.allow_adult))
     if im.animetrace_enabled:
         ps.append(AnimeTraceProvider(http, model=im.animetrace_model))
+    proxy = cfg.search.proxy.strip()
+    webs: list[Any] = []
+    # D84：节流器按引擎名共享（hub.pace 模块级），配置重载换 Provider 对象时计数和“下次可用时间”保留
+    web_pace = dict(pace.WEB_DEFAULT, min_gap=float(im.web_gap_seconds), jitter=float(im.web_gap_seconds),
+                    per_hour=im.web_rate_per_hour)
     if im.web_enabled:
         for eng in dict.fromkeys(e.strip().lower() for e in im.web_engines.split(",") if e.strip()):
             if eng in WEB_ENGINES:
-                ps.append(WEB_ENGINES[eng](proxy=cfg.search.proxy.strip()))
-    if im.container_url.strip() and im.container_key.strip():
-        for eng in [e.strip() for e in im.container_engines.split(",") if e.strip()]:
-            ps.append(ContainerImageProvider(http, im.container_url, im.container_key, eng))
+                cls = WEB_ENGINES[eng]
+                webs.append(cls(proxy=proxy, pacer=pace.pacer(f"img_{eng}", cls.label, **web_pace)))
+    if im.baidu_enabled:
+        # 0.6.1（D76）：百度识图排在 Yandex 之后（没有 Yandex 时排第一）
+        pos = next((i + 1 for i, p in enumerate(webs) if p.info.name == "img_yandex"), 0)
+        webs.insert(pos, BaiduImageProvider(proxy=proxy, pacer=pace.pacer("img_baidu", "百度识图", **web_pace)))
+    ps.extend(webs)
+    # Google Lens：SerpApi（官方接口、稳定）优先；没有 SerpApi 时用 camofox 浏览器（限频）
+    if im.serpapi_key.strip():
+        ps.append(SerpApiLensProvider(http, im.serpapi_key))
+    elif im.camofox_url.strip():
+        gap = float(im.camofox_gap_seconds)
+        lens_pace = dict(pace.BROWSER_DEFAULT, min_gap=gap, jitter=gap / 2, per_hour=im.camofox_rate_per_hour)
+        ps.append(CamofoxLensProvider(im.camofox_url.strip(), im.camofox_key,
+                                      pacer=pace.pacer("camofox_lens", "Google Lens（浏览器）", **lens_pace)))
     return ps
 
 
@@ -234,7 +292,8 @@ def _configured_secrets(cfg: HubConfig) -> list[str]:
     """所有填了的 key（F03 脱敏用）。"""
     s, im = cfg.sources, cfg.image
     keys = [getattr(s, n).api_key for n in KEYED_SOURCES]
-    keys += [s.keenable.api_key, s.tavily.api_key, im.tracemoe_key, im.saucenao_key, im.container_key]
+    keys += [s.keenable.api_key, s.tavily.api_key, im.tracemoe_key, im.saucenao_key,
+             im.serpapi_key, im.camofox_key]
     return [k for k in keys if isinstance(k, str) and k.strip()]
 
 
@@ -243,13 +302,14 @@ def _key_fingerprints(cfg: HubConfig) -> dict[str, str]:
     s, im = cfg.sources, cfg.image
     keys = {n: getattr(s, n).api_key for n in KEYED_SOURCES}
     keys.update(keenable=s.keenable.api_key, tavily=s.tavily.api_key, tracemoe=im.tracemoe_key,
-                saucenao=im.saucenao_key, container=im.container_key)
+                saucenao=im.saucenao_key, serpapi_lens=im.serpapi_key,
+                camofox_lens=im.camofox_key)
     return {n: hashlib.sha256(str(k or "").strip().encode()).hexdigest()[:16] for n, k in keys.items()}
 
 
 def _key_source(provider_name: str) -> str:
-    """Provider 名 → key 指纹里的来源名。容器引擎都共用容器 key（imgc_ 开头）。"""
-    return "container" if provider_name.startswith("imgc_") else provider_name
+    """Provider 名 → key 指纹里的来源名（0.6.1 起一一对应；保留函数以免改调用处）。"""
+    return provider_name
 
 
 class SearchHubPlugin(MaiBotPlugin):
@@ -304,7 +364,8 @@ class SearchHubPlugin(MaiBotPlugin):
         # 0.5.6（S2）：Host 的 Hook 没有唯一请求 ID。同一键下出现多个任务（并行子代理）时记成候选集合；
         # 配不上时退回本会话近期活跃的全部子代理任务。授权带上候选集合，按“任一候选到上限就拒绝、
         # 每个候选都计一次”处理：宁可偶尔误拒，也不让上限被绕过。
-        self._task_by_req: dict[tuple, tuple[frozenset[str], float]] = {}   # 配对键 -> (候选任务, 最近登记时间)
+        # 配对键 -> (候选任务, 最近登记时间, 还没收到响应的请求数)。R61-21：在途请求数归零前，候选一直保留
+        self._task_by_req: dict[tuple, tuple[frozenset[str], float, int]] = {}
         self._task_searches: dict[str, tuple[int, float]] = {}   # "会话|任务" -> (次数, 最近一次时间)
         self._task_seen: dict[str, dict[str, float]] = {}        # session -> {任务: 最近一次请求时间}
         self._last_prune = 0.0
@@ -343,6 +404,10 @@ class SearchHubPlugin(MaiBotPlugin):
         self.jobs.enrich = self._enrich
         self.jobs.on_finished = self._on_job_finished
         self.health.load(self.ledger.kv_get("health"))  # 第 3 阶段：冷却与延迟统计跨重启保留
+        try:   # D84：限速的“下次可用时间”和每小时计数也跨重启保留（不然重启一次就能多查一轮）
+            pace.load(json.loads(self.ledger.kv_get("pace") or "{}"))
+        except ValueError:
+            pace.load({})
         try:   # 上次运行时的 key 指纹：停机期间换了 key，启动时也能解除冷却
             self._key_fps = json.loads(self.ledger.kv_get("key_fps") or "{}")
         except ValueError:
@@ -357,7 +422,7 @@ class SearchHubPlugin(MaiBotPlugin):
         try:
             res = await self.ctx.component.list_loaded_plugins()
         except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning(f"检查旧插件失败（不影响使用）：{exc}")
+            self.ctx.logger.warning(redact(f"检查旧插件失败（不影响使用）：{exc}"))
             return
         # 实测（Host 1.3.18 / SDK 2.19）：SDK 已把 {"success", "plugins"} 拆成纯列表；两种形状都接受
         loaded = res.get("plugins", []) if isinstance(res, dict) else res if isinstance(res, list) else []
@@ -367,13 +432,15 @@ class SearchHubPlugin(MaiBotPlugin):
         self._old_plugin_hint = hint
 
     async def on_unload(self) -> None:
+        if self.jobs:
+            await self.jobs.shutdown()
+        # R62-10：任务都停下来之后再保存——最后一次请求收尾时设置的间隔也要存进去
         if self.ledger:
             try:
                 self.ledger.kv_set("health", self.health.dump())
+                self.ledger.kv_set("pace", json.dumps(pace.dump()))
             except Exception:  # noqa: BLE001
                 pass
-        if self.jobs:
-            await self.jobs.shutdown()
         if self._http:
             await self._http.aclose()
         if self._builtin:
@@ -426,6 +493,7 @@ class SearchHubPlugin(MaiBotPlugin):
             src = cfg.sources
             limits = {name: getattr(src, name).daily_limit for name in KEYED_SOURCES}
             limits["tavily"] = src.tavily.daily_limit
+            limits["serpapi_lens"] = cfg.image.serpapi_daily_limit
             self.budget = Budget(self.ledger.counter, self.ledger.counter_add, limits)
         # F02：读取器用独立的、不保持连接的客户端（见 BuiltinReader 说明）
         builtin = BuiltinReader.create(proxy=cfg.search.proxy.strip(), timeout=cfg.read.timeout_seconds)
@@ -480,8 +548,20 @@ class SearchHubPlugin(MaiBotPlugin):
         # F09/S2：配不上时退回本会话近期活跃的全部子代理任务，不能静默变成“无任务”而绕过次数上限
         task = ""
         if caller == "subagent":
-            entry = self._task_by_req.pop(key, None)
-            cands = entry[0] if entry else frozenset(self._recent_tasks(str(session_id)))
+            # R61-21：同一配对键上有多个子代理请求在途时，不能在第一个响应到达时就把候选取走——后到的响应会错配给
+            # 新登记的任务。按“在途请求数”保留候选，归零才清掉；每个响应都按全部候选保守计数（D66：宁可误拒）
+            entry = self._task_by_req.get(key)
+            if entry is not None and time.monotonic() - entry[1] > REQ_PAIR_TTL:
+                self._task_by_req.pop(key, None)
+                entry = None
+            if entry is not None:
+                cands = entry[0]
+                if entry[2] <= 1:
+                    self._task_by_req.pop(key, None)
+                else:
+                    self._task_by_req[key] = (entry[0], entry[1], entry[2] - 1)
+            else:
+                cands = frozenset(self._recent_tasks(str(session_id)))
             task = "|".join(sorted(cands))
         for it in out:
             tc = it.get("tool_call") if isinstance(it, dict) else None
@@ -519,9 +599,10 @@ class SearchHubPlugin(MaiBotPlugin):
                     rk = _req_key(kwargs)
                     now = time.monotonic()
                     old = self._task_by_req.pop(rk, None)
-                    # 同一配对键上还没取走的候选：仍在授权有效期内的才合并（响应里没调用本插件工具时不会被取走）
-                    keep = old[0] if old and now - old[1] <= REQ_PAIR_TTL else frozenset()
-                    self._task_by_req[rk] = (keep | {task}, now)
+                    # 同一配对键上还在途的请求：仍在授权有效期内的才合并（响应里没调用本插件工具时不会被取走）
+                    live = old is not None and now - old[1] <= REQ_PAIR_TTL
+                    keep, pending = (old[0], old[2]) if live and old else (frozenset(), 0)
+                    self._task_by_req[rk] = (keep | {task}, now, pending + 1)
                     seen = self._task_seen.setdefault(session_id, {})
                     seen[task] = now
             for d in (self._caller_by_req, self._task_by_req):
@@ -630,7 +711,8 @@ class SearchHubPlugin(MaiBotPlugin):
             ToolParameterInfo(name="intent", param_type=ToolParamType.STRING, required=False, default="auto",
                               enum_values=list(INTENTS),
                               description=("文字：facts 事实 / news 新闻动态 / howto 方法教程 / discussion 网友讨论 / "
-                                           "quote_origin 梗或台词出处。图片：image_source 出处作者 / identify_scene 哪部番哪一集 / "
+                                           "quote_origin 梗或台词出处。找图发给对方：find_image（query 写要找的图）。"
+                                           "以图搜图：image_source 出处作者 / identify_scene 哪部番哪一集 / "
                                            "identify_character 这是哪个角色 / identify_person 照片里的人 / similar_image 相似图片")),
             ToolParameterInfo(name="freshness", param_type=ToolParamType.STRING, required=False, default="any",
                               enum_values=["any", "recent", "today"], description="是否要求最近的内容"),
@@ -678,6 +760,8 @@ class SearchHubPlugin(MaiBotPlugin):
         image = str(image or "").strip()
         depth = depth if depth in DEPTHS else "normal"
         intent = intent if intent in INTENTS else "auto"
+        if intent == FIND_INTENT and not image:
+            return await self._find_image(grant, query)
         if image or intent in IMAGE_INTENTS:
             # 以图搜只看 [image] enabled（配置页上两个开关各管各的）
             return await self._search_image(grant, query, image, image_index, depth, intent, str(provider or "").strip())
@@ -705,6 +789,12 @@ class SearchHubPlugin(MaiBotPlugin):
         if existing is not None:
             # 同一会话的工具是串行执行的，所以进行中的同名任务一定已归后台，结果会经 proactive 送回，不再同步返回
             return {"success": True, "content": cards.merged_into(existing, grant.caller)}
+        if not str(provider or "").strip() and depth != "deep":
+            # D80：后台还在查同一个问题（换了说法、加了年份）时不再发起，等结果送回（正式实例 R6 实测：
+            # 模型等了 5 秒就加上“2024”重搜，旧结果把新结果挤掉了）。点名来源或 deep 档视为有意补查，放行。
+            same = next((j for j in self.jobs.active(session_id) if _similar_query(j.query, query)), None)
+            if same is not None:
+                return {"success": True, "content": cards.duplicate_running(same, grant.caller)}
 
         provider = str(provider or "").strip()
         cache_key = f"{nq}|{depth}|{intent}|{freshness}|{provider}"
@@ -768,8 +858,7 @@ class SearchHubPlugin(MaiBotPlugin):
             return {"success": False, "error": f"没能拿到图片：{err}。这不是搜索失败，请确认消息编号和图片序号。"}
         try:
             plan = make_image_plan(self._image_providers, self.health, depth=depth, intent=intent, image=prepared,
-                                   provider=provider,
-                                   container_order=[e.strip() for e in cfg.image.container_engines.split(",")])
+                                   provider=provider)
         except SourceError as err:
             return {"success": False, "error": f"以图搜未能发出：{err.message}。这不代表找不到出处。"}
         nq = f"image:{prepared.sha1}:{intent}"
@@ -783,17 +872,104 @@ class SearchHubPlugin(MaiBotPlugin):
         job = Job(self.ledger.next_job_id(), session_id, query or f"以图搜：{label}", depth, intent, "any",
                   grant.caller, norm_query=nq)
         job.image_hash = prepared.sha1
-        executor = ImageExecutor(self.health, self._builtin if cfg.image.verify_dhash else None)
+        executor = ImageExecutor(self.health, self._builtin if cfg.image.verify_dhash else None, budget=self.budget)
         window = (cfg.search.subagent_sync_window_seconds if grant.caller == "subagent"
                   else cfg.search.sync_window_seconds)
         await self.jobs.start(job, plan, executor, window)
         if job.owner == "sync":
             if job.result is None:
                 return {"success": False, "error": f"[搜索 {job.job_id} 状态未知] 内部错误，未自动重试。"}
-            return {"success": bool(job.result.used_sources), "content": cards.sync_result(job)}
+            content = cards.sync_result(job)
+            out: dict[str, Any] = {"success": bool(job.result.used_sources), "content": content}
+            # 0.6.1（D76）：同图的缩略图作为工具媒体附给模型；模型可用 reply 的 attach_pic 发出。照片找人不附
+            if cfg.image.attach_thumbnails and intent != "identify_person" and job.result.used_sources:
+                items = self._thumb_items(executor.same_image_thumbs(allow_adult=cfg.image.allow_adult))
+                if items:
+                    out["content"] = content + "\n" + cards.thumbs_line(len(items))
+                    out["content_items"] = items
+            return out
         eta_s = sum(self.health.p90(p.info.name, p.info.latency) for p in plan.steps[:2]) + 5
         eta = f"{int(eta_s)}–{int(eta_s * 2)} 秒" if eta_s < 30 else "1 分钟左右"
         return {"success": True, "content": cards.backgrounded(job, eta, grant.caller)}
+
+    async def _find_image(self, grant: Any, query: str) -> dict:
+        """D81：按关键词找图。同步返回（后台送回带不了图），候选图作为工具媒体交给模型挑。"""
+        cfg: HubConfig = self.config  # type: ignore[assignment]
+        if not cfg.image.find_enabled:
+            return {"success": False, "error": "管理员关闭了找图功能"}
+        if not cfg.search.allow_text_outbound:
+            return {"success": False, "error": "管理员关闭了文字搜索（找图要发出搜索词）"}
+        if not query:
+            return {"success": False, "error": "找图要在 query 里写要找什么图，例如“Steam Deck”"}
+        assert self.ledger and self._http
+        src = cfg.sources
+        finders: list[Any] = []
+        if src.searxng.enabled and src.searxng.base_url.strip():
+            finders.append(image_find.SearxngImages(self._http, src.searxng.base_url, src.searxng.engines))
+        if src.tavily.enabled:
+            finders.append(image_find.TavilyImages(self._http, src.tavily.api_key))
+        if not finders:
+            return {"success": False, "error": "没有可用的图片搜索来源（需要 SearXNG 地址或启用 Tavily）。如实告诉对方现在找不了图"}
+
+        def allow(f: Any) -> tuple[bool, str]:
+            if getattr(f, "paid", False) and self.budget is not None:
+                left = self.budget.daily_left("tavily")
+                if left is not None and left <= 0:
+                    return False, "Tavily 今日额度已用完"
+                self.budget.count("tavily")      # 与文字搜索共用同一计数
+            return True, ""
+
+        assert self.jobs
+        nq = f"find:{_norm_query(query)}"
+        existing, reason = self.jobs.admit(grant.session_id, nq, "quick")
+        if reason:
+            return {"success": False, "error": reason}
+        if existing is not None:
+            # R62-12：同一查询正在找——等它的结果，不另开一次（找图要同步交图，不能转后台合并）
+            res = await self.jobs.wait_tracked(existing, image_find.FIND_BUDGET + 2)
+            if res is None:
+                return {"success": False, "error": f"同一个找图请求 {existing.job_id} 正在进行或刚失败，本次没有重复发起"}
+            return self._find_payload(existing.job_id, query, res)
+        job_id = self.ledger.next_job_id()
+        job = Job(job_id, grant.session_id, query, "quick", FIND_INTENT, "any", grant.caller, norm_query=nq)
+        t0 = time.monotonic()
+        deadline = t0 + image_find.FIND_BUDGET + 2       # 排队也算在里面
+        try:
+            res = await self.jobs.run_tracked(job, lambda: image_find.find_images(
+                query, finders, self._builtin, want=cfg.image.find_count, safe=cfg.image.find_safe,
+                cpu=run_image_cpu, allow=allow, budget_s=max(1.0, deadline - 2 - time.monotonic())),
+                ok=lambda r: bool(r.picked), deadline=deadline)
+        except asyncio.CancelledError:
+            if job.status == "cancelled":
+                return {"success": False, "error": f"找图 {job_id} 已取消"}
+            raise
+        except asyncio.TimeoutError:
+            return {"success": False, "error": f"找图 {job_id} 排队或下载超时，这次没找到能发的图"}
+        except Exception as exc:  # noqa: BLE001 - R62-15：来源异常不让工具崩掉，照实记 failed
+            self.ctx.logger.warning(redact(f"找图 {job_id} 出错：{type(exc).__name__}"))
+            return {"success": False, "error": f"找图 {job_id} 出错了（{type(exc).__name__}），这次没找到能发的图"}
+        if self.ledger is None:          # 卸载中
+            return {"success": False, "error": "搜索中枢正在停止"}
+        self.ledger.trace({"job_id": job_id, "t": time.time(), "session_id": grant.session_id, "query": query[:200],
+                           "depth": "quick", "intent": FIND_INTENT, "caller": grant.caller,
+                           "outcome": "finished" if res.picked else "failed", "sync": 1,
+                           "seconds": round(time.monotonic() - t0, 2), "attempts": res.attempts,
+                           "missing": [] if res.picked else ["no_image"], "used_sns": [],
+                           "review": {"candidates": res.candidates, "picked": len(res.picked),
+                                      "failed_downloads": res.failed_downloads}})
+        return self._find_payload(job_id, query, res)
+
+    @staticmethod
+    def _find_payload(job_id: str, query: str, res: Any) -> dict:
+        if not res.picked:
+            why = "；".join(f"{a['src']}：{a['note'] or a['out']}" for a in res.attempts if a["out"] != "ok")
+            return {"success": False, "error": cards.find_none(query, res.candidates, why)}
+        import base64
+        items = [{"content_type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(p.jpeg).decode("ascii"),
+                  "name": f"found_{i + 1}.jpg",
+                  "description": f"{p.found.title[:40] or query}（{image_find._domain(p.found.page_url)}，{p.width}×{p.height}）"}
+                 for i, p in enumerate(res.picked)]
+        return {"success": True, "content": cards.find_result(job_id, query, res.picked), "content_items": items}
 
     @Tool(
         READ_TOOL,
@@ -934,6 +1110,7 @@ class SearchHubPlugin(MaiBotPlugin):
                        "results": [{**m.__dict__, "families": sorted(m.families)} for m in r.results[:12]]}
             self.ledger.cache_put(key, json.dumps(payload, ensure_ascii=False))
         self.ledger.kv_set("health", self.health.dump())
+        self.ledger.kv_set("pace", json.dumps(pace.dump()))
 
     async def _enrich(self, job: Job) -> None:
         """D72：读正文 + 结果核查。
@@ -952,45 +1129,82 @@ class SearchHubPlugin(MaiBotPlugin):
         failed: dict[int, str] = {}         # sn -> 读取失败原因（只记“网页不存在”这种确定的）
         reads: dict[int, str] = {}          # sn -> ok / 失败原因（全部尝试，记进调用记录）
         shown = job.entries[: (8 if job.depth == "deep" else 5)]
-        if n > 0 and may_read:
-            await self._read_top(job, shown, n, bodies, failed, reads)
-
         need = verify.time_need(job.query, job.goal, job.freshness, job.intent)
-        rule = {e.sn: verify.rule_check(job.query, need, title=e.title, snippet=e.snippet, body=bodies.get(e.sn),
-                                        published_at=e.published_at) for e in shown}
-        for sn, why in failed.items():
-            rule[sn] = verify.Check(verify.INVALID, why, "rule")
-        review = verify.Review(checks=rule, reads=reads)
-        if job.depth in ("normal", "deep") and cfg.verify.enabled and shown:
-            gen = getattr(getattr(self.ctx, "llm", None), "generate", None)
-            if gen is None:
-                review.model_error = "Host 没有提供模型能力"
-            else:
-                items = []
-                for e in shown:
-                    if rule[e.sn].verdict == verify.INVALID:
-                        continue
-                    date = e.published_at[:10] if e.published_at else rule[e.sn].page_date
-                    items.append((e.sn, e.title, cards._domain(e.url), date, e.snippet))
-                if items:
-                    # D73：模型填了 goal 就只用它；没填时才带最近几条聊天兜底
-                    chat = job.chat if cfg.verify.use_chat_context and not job.goal else ""
-                    prompt = verify.build_prompt(job.query, job.goal, chat,
-                                                 need, time.strftime("%Y-%m-%d"), items)
-                    try:
-                        model, gap = await verify.model_check(gen, prompt, {i[0] for i in items},
-                                                              task=cfg.verify.model_task.strip() or "utils",
-                                                              timeout=cfg.verify.timeout_seconds)
-                        review.checks = verify.merge_checks(rule, model)
-                        review.gap, review.by_model = gap, True
-                    except Exception as exc:  # noqa: BLE001 - 核查失败只用规则结果
-                        review.model_error = (str(exc) or type(exc).__name__)[:80]
-                        self.ctx.logger.warning(f"结果核查未完成，只用规则检查：{review.model_error}")
-        job.review = review
+
+        def rules() -> dict[int, verify.Check]:
+            r = {e.sn: verify.rule_check(job.query, need, title=e.title, snippet=e.snippet, body=bodies.get(e.sn),
+                                         published_at=e.published_at) for e in shown}
+            for sn, why in failed.items():
+                r[sn] = verify.Check(verify.INVALID, why, "rule")
+            return r
+
+        # R61-09：先存一份只基于摘要的规则核查——外层超时打断时，卡片至少有规则标签和“核查未完成”提示
+        job.review = verify.Review(checks=rules(), reads=reads)
+        # R62-14：不管是正常结束、超时还是取消，当时的核查标签都要写回账本（回复参考资料靠它排除无关条目）
         try:
-            self.ledger.set_verdicts(job.session_id, {sn: c.verdict for sn, c in review.checks.items()})
-        except Exception:  # noqa: BLE001
-            pass
+            deadline = time.monotonic() + max(5.0, self.jobs.enrich_timeout - 2.0) if self.jobs else time.monotonic() + 43.0
+            if n > 0 and may_read:
+                await self._read_top(job, shown, n, bodies, failed, reads)
+
+            rule = rules()
+            review = verify.Review(checks=rule, reads=reads)
+            job.review = review
+            model_budget = min(cfg.verify.timeout_seconds, deadline - time.monotonic())
+            if job.depth in ("normal", "deep") and cfg.verify.enabled and shown and model_budget < 3:
+                review.model_error = "核查超时"
+            elif job.depth in ("normal", "deep") and cfg.verify.enabled and shown:
+                gen = getattr(getattr(self.ctx, "llm", None), "generate", None)
+                if gen is None:
+                    review.model_error = "Host 没有提供模型能力"
+                else:
+                    items = []
+                    for e in shown:
+                        if rule[e.sn].verdict == verify.INVALID:
+                            continue
+                        # R61-05：来源没给发布日期时，正文里找到的日期标成“正文提到”，交给模型自己判断是不是发布时间
+                        date = e.published_at[:10] if e.published_at else (
+                            f"未知（正文提到 {rule[e.sn].page_date}）" if rule[e.sn].page_date else None)
+                        items.append((e.sn, e.title, cards._domain(e.url), date, e.snippet))
+                    if items:
+                        # D73：模型填了 goal 就只用它；没填时才带最近几条聊天兜底
+                        chat = job.chat if cfg.verify.use_chat_context and not job.goal else ""
+                        prompt = verify.build_prompt(job.query, job.goal, chat,
+                                                     need, time.strftime("%Y-%m-%d"), items)
+                        task = cfg.verify.model_task.strip() or "fast_model"
+                        try:
+                            try:
+                                model, gap = await verify.model_check(gen, prompt, {i[0] for i in items},
+                                                                      task=task, timeout=model_budget)
+                            except ValueError as exc:
+                                # 老 Host 没有 fast_model 任务（或用户填的任务名不存在）：退回 utils 再试一次
+                                if task == "utils" or "未找到" not in str(exc):
+                                    raise
+                                left = deadline - time.monotonic()
+                                if left < 3:
+                                    raise ValueError("核查超时") from None
+                                model, gap = await verify.model_check(gen, prompt, {i[0] for i in items},
+                                                                      task="utils", timeout=min(cfg.verify.timeout_seconds, left))
+                            review.checks = verify.merge_checks(rule, model)
+                            review.model_sns = set(model)
+                            review.gap, review.by_model = str(gap), True
+                            review.conflict = bool(getattr(gap, "conflict", False))
+                        except Exception as exc:  # noqa: BLE001 - 核查失败只用规则结果
+                            review.model_error = redact(str(exc) or type(exc).__name__)[:80]     # R61-01
+                            self.ctx.logger.warning(f"结果核查未完成，只用规则检查：{review.model_error}")
+            job.review = review
+        finally:
+            # R63-02：读原文阶段被取消/超时时，job.review 还是最初那份只看摘要的规则结果——已经读到的 404、
+            # 墙页等信息没算进去。这里用当时已拿到的 bodies/failed 重算一遍规则，再保留模型已经给出的标签
+            # （模型判过的以模型为准，规则的“无效”仍一票否决，和正常路径的 merge_checks 一致）
+            try:
+                cur = job.review
+                if not cur.by_model:
+                    fresh = rules()
+                    job.review = verify.Review(checks=fresh, reads=reads, model_error=cur.model_error,
+                                               model_sns=getattr(cur, "model_sns", set()))
+                self.ledger.set_verdicts(job.session_id, {sn: c.verdict for sn, c in job.review.checks.items()})
+            except Exception:  # noqa: BLE001
+                pass
 
     READ_EXTRA = 2          # D72 补充：读不到时最多再换几条结果
     READ_BUDGET = 20.0      # 自动读原文的总时限（秒）
@@ -1028,7 +1242,11 @@ class SearchHubPlugin(MaiBotPlugin):
             if bad:
                 return False
             text, _ = excerpt(page.text, focus, 500)
-            if len(text) > len(e.snippet):
+            if not text.strip():
+                reads[e.sn] = "没摘出相关段落"      # R61-08：下载成功但没用上，不算读到
+                return False
+            # R63-01：摘录比摘要长、而且没少掉摘要里命中的词，才替换；否则保留原摘要（读到了但没更好）
+            if len(text) > len(e.snippet) and _covers(text, e.snippet, focus):
                 e.snippet, e.read = text, True
                 self.ledger.set_page(job.session_id, e.sn, text)
             return True
@@ -1036,21 +1254,48 @@ class SearchHubPlugin(MaiBotPlugin):
         async def run() -> None:
             nonlocal tries_left, good
             running: set[asyncio.Task] = set()
-            while good < n and (pool or running):
-                while pool and tries_left > 0 and len(running) < n - good:
-                    tries_left -= 1
-                    running.add(asyncio.create_task(one(pool.pop(0))))
-                if not running:
-                    break
-                done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                good += sum(1 for t in done if not t.cancelled() and t.exception() is None and t.result())
-            for t in running:
-                t.cancel()
+            try:
+                while good < n and (pool or running):
+                    while pool and tries_left > 0 and len(running) < n - good:
+                        tries_left -= 1
+                        running.add(asyncio.create_task(one(pool.pop(0))))
+                    if not running:
+                        break
+                    done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                    good += sum(1 for t in done if not t.cancelled() and t.exception() is None and t.result())
+            finally:
+                # R61-03：超时、取消、正常结束都要停掉还在读的子任务，并等它们真正结束
+                for t in running:
+                    t.cancel()
+                if running:
+                    await asyncio.gather(*running, return_exceptions=True)
 
         try:
             await asyncio.wait_for(run(), timeout=self.READ_BUDGET)
         except asyncio.TimeoutError:
             pass
+
+    @staticmethod
+    def _thumb_items(thumbs: list[tuple[Any, bytes]]) -> list[dict[str, Any]]:
+        """缩略图重新编码成 JPEG（去掉元数据、限制尺寸），作为 Host 的 content_items（type=image，base64）。"""
+        import base64
+        import io
+
+        from PIL import Image
+        items: list[dict[str, Any]] = []
+        for hit, data in thumbs:
+            try:
+                im = Image.open(io.BytesIO(data)).convert("RGB")
+                im.thumbnail((512, 512))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=85)
+            except Exception:  # noqa: BLE001 - 坏图就不附
+                continue
+            items.append({"content_type": "image", "mime_type": "image/jpeg",
+                          "data": base64.b64encode(buf.getvalue()).decode("ascii"),
+                          "name": "same_image.jpg",
+                          "description": f"同一张图：{hit.title[:40]}（{cards._domain(hit.url)}）"})
+        return items
 
     def _rule_review(self, job: Job) -> None:
         """只做规则核查（缓存命中时用）。"""
@@ -1079,11 +1324,11 @@ class SearchHubPlugin(MaiBotPlugin):
         try:
             res = await self.ctx.maisaka.trigger_proactive(session_id, text, reason="search_hub_result")
         except Exception as exc:  # noqa: BLE001
-            self.ctx.logger.warning(f"后台搜索结果送回失败：{exc}")
+            self.ctx.logger.warning(redact(f"后台搜索结果送回失败：{exc}"))
             return False
         ok = isinstance(res, dict) and res.get("success") is not False
         if not ok:
-            self.ctx.logger.warning(f"后台搜索结果送回被拒绝：{res}")
+            self.ctx.logger.warning(redact(f"后台搜索结果送回被拒绝：{res}"))
         return ok
 
     # ---------------- 命令 ----------------
@@ -1120,7 +1365,8 @@ class SearchHubPlugin(MaiBotPlugin):
         if not tr:
             text = f"本会话没有 {job_id} 的轨迹。"
         else:
-            steps = "；".join(f"{a['src']} {a['out']} {a['s']}s{(' ' + str(a['n']) + '条') if a['out'] == 'ok' else ''}"
+            steps = "；".join(f"{a.get('src', '?')} {a.get('out', '?')} {a.get('s', '?')}s"
+                              f"{(' ' + str(a.get('n', 0)) + '条') if a.get('out') == 'ok' else ''}"
                               f"{(' (' + a['note'] + ')') if a['note'] else ''}" for a in tr["attempts"])
             text = (f"{job_id} {tr['depth']} 「{tr['query'][:40]}」 → {tr['outcome']}，用时 {tr['seconds']}s\n"
                     f"步骤：{steps or '无'}\n缺口：{'、'.join(tr['missing']) or '无'}")
@@ -1155,9 +1401,11 @@ class SearchHubPlugin(MaiBotPlugin):
             for p in self._image_providers:
                 st = snap.get(p.info.name, {})
                 cd = f"，冷却 {st['cooldown_s']}s（{st['reason']}）" if st.get("cooldown_s") else ""
-                lines.append(f"- {p.info.label}：成功 {st.get('ok', 0)} / 失败 {st.get('fail', 0)}{cd}")
+                pc = getattr(p, "pacer", None)
+                pace_txt = f"；限速：{pc.status()}" if pc is not None else ""      # D84
+                lines.append(f"- {p.info.label}：成功 {st.get('ok', 0)} / 失败 {st.get('fail', 0)}{cd}{pace_txt}")
             if not cfg.image.saucenao_key.strip():
-                lines.append("  （SauceNAO 未填 key；以图搜容器" + ("未配置" if not cfg.image.container_url else "已配置") + "）")
+                lines.append("  （SauceNAO 未填 key）")
         idle = [n for n in KEYED_SOURCES if n not in active]
         if idle:
             lines.append("未启用（填 key 即启用，申请方法见插件目录里的 KEYS.md）：" + "、".join(cards.SOURCE_LABEL.get(n, n) for n in idle)

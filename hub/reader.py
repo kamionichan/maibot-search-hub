@@ -207,21 +207,31 @@ class BuiltinReader:
             raise SourceError(Outcome.REJECTED, "网页没有可读正文（可能需要 JavaScript）")
         return Page(final, title, text, "builtin")
 
-    async def fetch_bytes(self, url: str, *, max_bytes: int, accept: tuple[str, ...]) -> bytes:
-        """按内容类型下载二进制（第 4 阶段：图片 URL 输入、dHash 候选图）。同样的 SSRF 防护。"""
-        _, data, _ = await self._download(url, max_bytes, accept, "image/*;q=0.9,*/*;q=0.1", truncate=False)
+    async def fetch_bytes(self, url: str, *, max_bytes: int, accept: tuple[str, ...], hop: Any = None) -> bytes:
+        """按内容类型下载二进制（第 4 阶段：图片 URL 输入、dHash 候选图）。同样的 SSRF 防护。
+
+        hop：可选的每跳节流钩子（R63-06），hop(当前网址) 返回异步上下文、产出是否放行；每一跳按那一跳的实际网站
+        取名额，只包住这一次请求。不放行时抛 SourceError（NOT_SENT）。"""
+        _, data, _ = await self._download(url, max_bytes, accept, "image/*;q=0.9,*/*;q=0.1", truncate=False, hop=hop)
         return data
 
     async def _download(self, url: str, max_bytes: int, accept: tuple[str, ...], accept_header: str,
-                        truncate: bool = True) -> tuple[str, bytes, str]:
+                        truncate: bool = True, hop: Any = None) -> tuple[str, bytes, str]:
         current = url
-        for hop in range(6):
+        for n in range(6):
             req_urls, host_header, sni = await validate_public_url(current, self._resolver)
             if not self._pin_ip:
                 # 走代理：已确认目标是公网地址；用原域名发出，TLS 证书按域名校验
                 req_urls, sni = [current.split("#", 1)[0]], None
-            result = await self._get_once(req_urls, host_header, sni, current, hop, max_bytes, accept,
-                                          accept_header, truncate)
+            if hop is None:
+                result = await self._get_once(req_urls, host_header, sni, current, n, max_bytes, accept,
+                                              accept_header, truncate)
+            else:
+                async with hop(current) as ok:
+                    if not ok:
+                        raise SourceError(Outcome.NOT_SENT, "等不到下载名额（按网站限速）")
+                    result = await self._get_once(req_urls, host_header, sni, current, n, max_bytes, accept,
+                                                  accept_header, truncate)
             if isinstance(result, str):
                 current = result
                 continue
@@ -374,36 +384,141 @@ class ReadChain:
 
 # ---------------- 摘录 ----------------
 def excerpt(text: str, focus: str, limit: int = 2200) -> tuple[str, bool]:
-    """按 focus 关键词挑段落；没有 focus 时取开头。返回 (摘录, 是否截断)。"""
+    """按 focus 关键词取正文里最相关的部分；没有 focus 或一个词都没命中时取开头。返回 (摘录, 是否截断)。
+
+    做法（规则尽量少，每条对应一个已知的坑）：
+    1. 关注词去重只去掉“匹配起来等价”的（R66-01：用和匹配同一套规则判断，ß 和 SS 不算重复）。
+    2. 每个关注词各自独立在原文上 re.IGNORECASE 匹配（R65-04：短词不吞长词；R64-03/R65-03：位置就是原文位置），
+       每词最多 2000 个命中；比 limit 长的命中不参与选窗口（R65-01）。
+    3. 选窗口：窗口是 [w, w+limit)，命中完整落在里面才算。取“不同词最多、其次命中最多”的窗口，同分取起点最早的命中候选。
+       用扫描线精确求最优（R66-02：命中互相重叠时，双指针会漏掉更好的窗口），计算量 O(H log H)（R64-01）。
+    4. 核心 = 最优窗口里第一个命中的起点到最后一个命中的终点，一定完整保留（R64-02）；前面留约三分之一给上文。
+    5. 两端只在窗口头尾各 15% 的范围里对齐句子边界；只认中文句末标点、换行，或后面跟空白的英文标点（R65-02）。
+    6. 剩余预算给窗口外的其他命中开小窗口；分隔符算进 limit（R64-04）。"""
     text = text.strip()
     if len(text) <= limit:
         return text, False
-    paras = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
-    terms = [t for t in re.split(r"[\s,，、；;]+", focus.lower()) if t] if focus else []
-    if not terms:
-        out, n = [], 0
-        for p in paras:
-            if n + len(p) > limit:
+    hits = _hits(text, _focus_terms(focus), limit)
+    if not hits:
+        return _head(text, limit), True
+    core_a, core_b, _ = _select(hits, limit)
+    a, b = _grow(text, core_a, core_b, limit)
+    parts = [(a, b)]
+    used = b - a
+    sep = "\n……\n"
+    for s, e, _ in hits:
+        room = limit - used - len(sep)
+        if room < 60:
+            break
+        if any(x <= s and e <= y for x, y in parts):
+            continue
+        x, y = _grow(text, s, e, min(room, max(120, limit // 4)))
+        if any(not (y <= px or x >= py) for px, py in parts):
+            continue
+        parts.append((x, y))
+        used += (y - x) + len(sep)
+    parts.sort()
+    return sep.join(text[x:y] for x, y in parts), True
+
+
+_MAX_HITS_PER_TERM = 2000      # R64-01：每个关注词最多看前 2000 个命中，计算量有上限
+# 句子边界：中文句末标点、换行；英文标点后面必须跟空白（URL 里的 ?、命令里的 ; 不算）
+_SENT_END = re.compile(r"[。！？；\n]|[.!?;](?=\s)")
+_EDGE = 0.15                   # 只在窗口两头各 15% 的范围里找边界
+
+
+def _focus_terms(focus: str) -> list[str]:
+    """关注词：按空白和中文标点切开，保留原样，最多 12 个。
+    R66-01：只有“用 re.IGNORECASE 匹配时等价”的才算重复——ß 和 SS 在 casefold 下相同，但正则不认为相等，
+    两个都要留着，否则原文里写的 SS 就找不到了。"""
+    out: list[str] = []
+    for t in re.split(r"[\s,，、；;]+", focus or ""):
+        if t and not any(re.fullmatch(re.escape(p), t, re.IGNORECASE) for p in out):
+            out.append(t)
+            if len(out) >= 12:
                 break
-            out.append(p)
-            n += len(p) + 1
-        return "\n".join(out) or text[:limit], True
-    scored = sorted(range(len(paras)), key=lambda i: -sum(paras[i].lower().count(t) for t in terms))
-    chosen, n = set(), 0
-    for i in scored:
-        if sum(paras[i].lower().count(t) for t in terms) == 0 and chosen:
-            break
-        for j in (i - 1, i, i + 1):  # 带上前后文
-            if 0 <= j < len(paras) and j not in chosen and n + len(paras[j]) <= limit:
-                chosen.add(j)
-                n += len(paras[j]) + 1
-        if n >= limit * 0.9:
-            break
-    out = []
-    last = -2
-    for j in sorted(chosen):
-        if j != last + 1 and out:
-            out.append("……")
-        out.append(paras[j])
-        last = j
-    return "\n".join(out), True
+    return out
+
+
+def _hits(text: str, terms: list[str], limit: int) -> list[tuple[int, int, int]]:
+    """所有命中 (起点, 终点, 词序号)，按起点排序。比 limit 长的命中丢掉。"""
+    hits: list[tuple[int, int, int]] = []
+    for k, t in enumerate(terms):
+        for n, m in enumerate(re.finditer(re.escape(t), text, re.IGNORECASE)):
+            if n >= _MAX_HITS_PER_TERM:
+                break
+            if m.end() - m.start() <= limit:
+                hits.append((m.start(), m.end(), k))
+    hits.sort()
+    return hits
+
+
+def _select(hits: list[tuple[int, int, int]], limit: int) -> tuple[int, int, tuple[int, int]]:
+    """在 [w, w+limit) 形式的窗口里，找完整包含的命中“不同词数最多、其次命中数最多”的一个。
+    候选 w 只取命中起点；同分时取起点最早的那个候选（R67-02：不是“整数意义上最早的 w”，那个 w 可能在第一个命中之前，
+    但包含的命中集合相同，所以核心相同）。返回 (核心起点, 核心终点, (不同词数, 命中数))，核心 = 第一个命中起点到最后一个命中终点。
+
+    最优窗口总可以右移到左端贴住它包含的第一个命中的起点而不丢命中，所以候选 w 只需取各命中的起点。
+    命中 j 被窗口 w 包含 ⇔ e_j - limit <= w <= s_j：按 w 从小到大扫，按 e_j 顺序加入、按 s_j 顺序移除。"""
+    starts = sorted({s for s, _, _ in hits})
+    by_end = sorted(range(len(hits)), key=lambda j: hits[j][1])
+    by_start = list(range(len(hits)))          # hits 已按起点排序
+    counts: dict[int, int] = {}
+    inwin: set[int] = set()
+    total = 0
+    ai = ri = 0
+    best_key, best_w = (-1, -1), starts[0]
+    for w in starts:
+        while ai < len(by_end) and hits[by_end[ai]][1] - limit <= w:
+            j = by_end[ai]
+            ai += 1
+            if hits[j][0] >= w:                 # 起点已经在窗口左边的不加（它的有效区间已经过去了）
+                counts[hits[j][2]] = counts.get(hits[j][2], 0) + 1
+                total += 1
+                inwin.add(j)
+        while ri < len(by_start) and hits[by_start[ri]][0] < w:
+            j = by_start[ri]
+            ri += 1
+            if j in inwin:
+                inwin.discard(j)
+                k = hits[j][2]
+                counts[k] -= 1
+                if not counts[k]:
+                    del counts[k]
+                total -= 1
+        key = (len(counts), total)
+        if key > best_key:
+            best_key, best_w = key, w
+    inside = [(s, e) for s, e, _ in hits if s >= best_w and e <= best_w + limit]
+    return best_w, max(e for _, e in inside), best_key
+
+
+def _grow(text: str, core_a: int, core_b: int, size: int) -> tuple[int, int]:
+    """以 [core_a, core_b) 为必须保留的核心，扩成最多 size 长的窗口：前面留约三分之一给上文；
+    两端只在窗口头尾各 15% 的范围内对齐到句子边界，并且从不缩进核心。"""
+    if core_b - core_a >= size:
+        return core_a, core_a + size
+    spare = size - (core_b - core_a)
+    a = max(0, core_a - spare // 3)
+    b = min(len(text), a + size)
+    a = max(0, min(a, b - size))
+    edge = int(size * _EDGE)
+    if a > 0:
+        m = _SENT_END.search(text, a, min(core_a, a + edge))
+        if m:
+            a = m.end()
+    if b < len(text):
+        cut = None
+        for m in _SENT_END.finditer(text, max(core_b, b - edge), b):
+            cut = m.end()
+        if cut:
+            b = cut
+    return a, b
+
+
+def _head(text: str, limit: int) -> str:
+    """开头 limit 字，尾部 15% 范围内有句末就停在句末。"""
+    cut = None
+    for m in _SENT_END.finditer(text, limit - int(limit * _EDGE), limit):
+        cut = m.end()
+    return text[: cut or limit].strip()

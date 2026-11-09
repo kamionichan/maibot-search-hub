@@ -29,14 +29,17 @@ from .merge import Merged, normalize_url
 from .net import Outcome, SourceError
 
 ROUTES = {
-    # "web" = 其余内置抓网页引擎（按配置顺序），"container" = 容器里的引擎；写了具体名字的排在指定位置
-    "identify_scene": ("tracemoe", "saucenao", "img_yandex"),
-    "identify_character": ("animetrace", "saucenao", "img_yandex", "img_bing"),
-    "image_source": ("saucenao", "tracemoe", "img_yandex", "animetrace", "web", "container"),
-    "auto": ("saucenao", "tracemoe", "img_yandex", "animetrace", "web", "container"),
-    "identify_person": ("web", "container"),
-    "similar_image": ("web", "container"),
+    # "web" = 其余内置抓网页引擎（按配置顺序，0.6.1 起含百度识图），"lens" = Google Lens（SerpApi 或 camofox）；
+    # 写了具体名字的排在指定位置。0.6.1（D77）去掉了外部容器
+    "identify_scene": ("tracemoe", "saucenao", "img_yandex", "lens"),
+    "identify_character": ("animetrace", "saucenao", "img_yandex", "img_bing", "lens"),
+    "image_source": ("saucenao", "tracemoe", "img_yandex", "img_baidu", "animetrace", "lens", "web"),
+    "auto": ("saucenao", "tracemoe", "img_yandex", "img_baidu", "animetrace", "lens", "web"),
+    "identify_person": ("web", "lens"),
+    "similar_image": ("web", "lens"),
 }
+# 0.6.1（D76）：Google Lens 有额度/限频，只在 deep 档、点名，或前面的引擎都没拿到“命中”时才用（见 ImageExecutor.run）
+LENS_ONLY_IF_NO_HIT = True
 STEPS = {"quick": 1, "normal": 4, "deep": 6}
 LEVEL_TEXT = {"hit": "命中", "likely": "疑似", "weak": "弱线索"}
 KIND_TEXT = {"scene": "番剧截图", "character": "角色", "source": "出处", "visual": "相似图片", "guess": "识别关键词"}
@@ -51,17 +54,15 @@ class ImagePlan:
     image: Any                            # PreparedImage
     skipped: list[tuple[str, str]] = field(default_factory=list)
     primary: list[Any] = field(default_factory=list)   # 兼容 JobManager 的 eta 估算
+    forced: str = ""                                    # 点名的来源（点名 Lens 时不受“前面没命中才用”限制）
 
 
 def make_image_plan(providers: list[Any], health: Health, *, depth: str, intent: str, image: Any,
-                    provider: str = "", container_order: list[str] | None = None) -> ImagePlan:
+                    provider: str = "") -> ImagePlan:
     route = ROUTES.get(intent, ROUTES["auto"])
     by_name = {p.info.name: p for p in providers}
-    containers = [p for p in providers if p.info.extra.get("container")]
     webs = [p for p in providers if p.info.extra.get("web")]
-    if container_order:
-        rank = {f"imgc_{n}": i for i, n in enumerate(container_order)}
-        containers.sort(key=lambda p: rank.get(p.info.name, 99))
+    lenses = [p for p in providers if p.info.extra.get("lens")]
     steps: list[Any] = []
     skipped: list[tuple[str, str]] = []
     if provider:
@@ -72,7 +73,7 @@ def make_image_plan(providers: list[Any], health: Health, *, depth: str, intent:
             raise SourceError(Outcome.NOT_SENT, f"以图搜来源 {provider} 暂不可用：{health.cooldown_reason(p.info.name)}")
         steps.append(p)
     for step in route:
-        cands = (containers if step == "container" else webs if step == "web"
+        cands = (webs if step == "web" else lenses if step == "lens"
                  else [by_name[step]] if step in by_name else [])
         for p in cands:
             if p in steps:
@@ -86,8 +87,11 @@ def make_image_plan(providers: list[Any], health: Health, *, depth: str, intent:
         need = ("Yandex/Bing 未开启且没有部署以图搜容器" if intent in ("identify_person", "similar_image")
                 else "没有可用的以图搜来源")
         raise SourceError(Outcome.NOT_SENT, need + (f"（{why}）" if why else ""))
-    steps = steps[: STEPS.get(depth, 3) + (1 if provider else 0)]
-    return ImagePlan(depth, intent, steps, image, skipped, primary=steps[:1])
+    # Lens 不占普通档的步数：截断后再把它补在最后（执行时只有前面都没命中才用）
+    lens_tail = [p for p in steps if p.info.extra.get("lens") and p.info.name != provider]
+    head = [p for p in steps if p not in lens_tail][: STEPS.get(depth, 3) + (1 if provider else 0)]
+    steps = head + ([] if depth == "quick" and head else lens_tail)
+    return ImagePlan(depth, intent, steps, image, skipped, primary=steps[:1], forced=provider)
 
 
 # 0.5.6（S4）：解码并发上限由线程池本身保证（2 个工作线程）。之前用 asyncio 信号量包住 run_in_executor，
@@ -101,11 +105,26 @@ async def run_image_cpu(fn: Any, *args: Any) -> Any:
 
 
 class ImageExecutor:
-    def __init__(self, health: Health, reader: Any = None, *, verify_limit: int = 5) -> None:
+    def __init__(self, health: Health, reader: Any = None, *, verify_limit: int = 5, budget: Any = None) -> None:
         self.health = health
         self.reader = reader
         self.verify_limit = verify_limit
+        self.budget = budget
         self._state: tuple[list[ImageHit], list[Attempt], list[str], list[SourceError]] | None = None
+
+    def same_image_thumbs(self, *, allow_adult: bool, limit: int = 2) -> list[tuple[ImageHit, bytes]]:
+        """0.6.1（D76）：核对为“同图”的候选缩略图（按结果顺序，最多 limit 张）。成人向只在允许时给。"""
+        if self._state is None:
+            return []
+        out: list[tuple[ImageHit, bytes]] = []
+        for h in self._state[0]:
+            data = h.extra.get("_thumb")
+            if not data or (h.nsfw and not allow_adult):
+                continue
+            out.append((h, data))
+            if len(out) >= limit:
+                break
+        return out
 
     def partial(self) -> RunResult | None:
         """F05（0.5.2）：任务超时或被取消时，交付已经跑完的引擎的结果。"""
@@ -125,14 +144,44 @@ class ImageExecutor:
         errors: list[SourceError] = []
         self._state = (hits, attempts, used, errors)
         kinds_done: set[str] = set()
+        best_so_far = "none"
+        sb = self.budget.for_search(plan.depth) if self.budget is not None else None
         for p in plan.steps:
+            is_lens = bool(p.info.extra.get("lens"))
+            if (is_lens and LENS_ONLY_IF_NO_HIT and plan.depth != "deep" and plan.forced not in (p.info.name, "lens")
+                    and best_so_far == "hit"):
+                continue
+            # R61-18：建计划之后才进入冷却的（例如别的搜索刚遇到验证页），发请求前再查一次
+            if not self.health.available(p.info.name):
+                attempts.append(Attempt(p.info.name, time.monotonic(), outcome="skipped",
+                                        note=self.health.cooldown_reason(p.info.name) or "冷却中"))
+                continue
+            if p.info.paid and self.budget is not None and sb is not None:
+                ok, why = self.budget.allows(p.info, sb)
+                if not ok:
+                    attempts.append(Attempt(p.info.name, time.monotonic(), outcome="skipped", note=why))
+                    continue
+                self.budget.charge(p.info, sb)   # D36：发出就计数（状态未知也算），宁可多计
             a = Attempt(p.info.name, time.monotonic())
             attempts.append(a)
             try:
-                many = p.info.extra.get("container") or p.info.extra.get("web")
-                got = await p.search_image(plan.image.jpeg, max_results=5 if many else 3)
+                many = p.info.extra.get("web") or is_lens
+                if getattr(p, "pacer", None) is not None:
+                    # R62-08：排队等名额期间，别的请求可能让这个引擎进了冷却——放行前再查一次
+                    name = p.info.name
+
+                    def ready(name: str = name) -> str:
+                        if self.health.available(name):
+                            return ""
+                        return f"{p.info.label or name} 排队期间进入冷却（{self.health.cooldown_reason(name) or '冷却中'}），这次没发"
+                    got = await p.search_image(plan.image.jpeg, max_results=5 if many else 3, ready=ready)
+                else:
+                    got = await p.search_image(plan.image.jpeg, max_results=5 if many else 3)
             except SourceError as err:
                 a.outcome, a.note, a.seconds = err.outcome.value, err.message, time.monotonic() - a.started
+                if err.budget:      # 本地限频挡下：没发出、不是来源故障，也不算这次搜索失败
+                    a.outcome = "skipped"
+                    continue
                 self.health.failure(p.info.name, err, p.info.extra.get("key_gen"))
                 errors.append(err)
                 continue
@@ -154,6 +203,9 @@ class ImageExecutor:
             if got and self.reader is not None and (many or p.info.extra.get("verify_thumbs")):
                 await self._verify(plan.image.dhash, got, only_thumbs=not many)
             best = _best_level(got)
+            if best != "none" and (best_so_far == "none" or {"hit": 0, "likely": 1, "weak": 2}[best]
+                                   < {"hit": 0, "likely": 1, "weak": 2}.get(best_so_far, 3)):
+                best_so_far = best
             kinds_done.update(h.kind for h in got)
             if best == "hit" and plan.depth != "deep":
                 break
@@ -169,11 +221,17 @@ class ImageExecutor:
         cands = [h for h in hits if h.extra.get("thumbnail") or (not only_thumbs and _looks_like_image(h.url))]
         cands = [h for h in cands if h.kind in ("visual", "source", "scene", "character")][: self.verify_limit]
 
+        from .image_find import paced_fetch
+        from .pace import DOWNLOADS
+        deadline = time.monotonic() + 12.0
+
         async def one(h: ImageHit) -> None:
             url = h.extra.get("thumbnail") or h.url
             try:
-                data = await asyncio.wait_for(self.reader.fetch_bytes(url, max_bytes=5 * 1024 * 1024, accept=("image/",)),
-                                              timeout=10)
+                # 用户同意：候选缩略图按网站限速（同一网站同一时间一张、间隔 1–2 秒）；R63-06：按每一跳的实际网站。
+                # 等不到名额就算“未验证”
+                data = await asyncio.wait_for(paced_fetch(self.reader, DOWNLOADS, url, deadline, 5 * 1024 * 1024),
+                                              timeout=max(0.5, min(10.0, deadline - time.monotonic())))
             except Exception:  # noqa: BLE001
                 h.extra["verify"] = "未验证"
                 return
@@ -186,6 +244,7 @@ class ImageExecutor:
             h.extra["dhash_distance"] = d
             if d <= DHASH_HIT:
                 h.level, h.extra["verify"] = "hit", "同图"
+                h.extra["_thumb"] = data      # 0.6.1（D76）：同图的缩略图留着，同步返回时可以附给模型
             elif d <= DHASH_LIKELY:
                 if h.level == "weak":
                     h.level = "likely"
@@ -224,9 +283,14 @@ def _to_result(hits: list[ImageHit], attempts: list[Attempt], used: list[str], e
     results = list(merged.values())
     best = _best_level(hits)
     missing = [] if best == "hit" else (["few"] if not hits else ["image_weak"])
+    limited = [a for a in attempts if a.outcome == "skipped" and a.note]
     if not used:
         kinds = {e.outcome for e in errors}
         kind = "unknown" if Outcome.UNKNOWN in kinds else "rejected" if Outcome.REJECTED in kinds else "not_sent"
-        msg = "；".join(dict.fromkeys(e.message for e in errors)) or "没有可用的以图搜来源"
+        msgs = list(dict.fromkeys([e.message for e in errors] + [a.note for a in limited]))
+        msg = "；".join(msgs) or "没有可用的以图搜来源"
+        # D84：一个引擎都没真正查到、而且有引擎是因为限速/冷却/额度被跳过的——单独标出来，让麦麦如实说“暂时用不了”
+        if limited and not errors:
+            kind = "limited"
         return RunResult([], ["few"], attempts, used, complete=False, error=msg, error_kind=kind)
-    return RunResult(results, missing, attempts, used, complete=not errors)
+    return RunResult(results, missing, attempts, used, complete=not errors and not limited)

@@ -24,6 +24,7 @@ import asyncio
 import html
 import json
 import logging
+import random
 import re
 import threading
 from contextlib import contextmanager
@@ -34,7 +35,8 @@ from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlspli
 import httpx
 
 from .image_sources import ImageHit
-from .net import Outcome, SourceError, classify_exception
+from .net import Outcome, SourceError, classify_exception, redact
+from .pace import WEB_DEFAULT, Pacer
 from .providers import ProviderInfo, _clip, _valid_url
 
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -89,8 +91,9 @@ class _Session:
     """一次搜索的受限 HTTP 会话。"""
 
     def __init__(self, engine: str, hosts: frozenset[str], *, proxy: str = "", timeout: float = 40.0,
-                 transport: httpx.AsyncBaseTransport | None = None) -> None:
+                 transport: httpx.AsyncBaseTransport | None = None, pacer: Pacer | None = None) -> None:
         self.engine, self.hosts, self.requests = engine, hosts, 0
+        self._pacer = pacer
         kw: dict[str, Any] = {"timeout": httpx.Timeout(connect=8.0, read=timeout, write=20.0, pool=5.0),
                               "follow_redirects": False, "trust_env": False,
                               "headers": {"User-Agent": BROWSER_UA, "Accept-Encoding": "identity",
@@ -115,11 +118,21 @@ class _Session:
         """发一个请求（不跟随跳转），返回 (状态码, URL, 文本, 响应头)。"""
         req = self.client.build_request(method, url, **kw)
         self._check_url(req.url)
+        if self.requests and self._pacer is not None:
+            await self._pacer.step()          # D84：同一次搜索里前后两个请求之间随机停一下（上传 → 跳转 → 结果页）
         self.requests += 1
         if self.requests > MAX_REQUESTS:
             raise SourceError(Outcome.UNKNOWN, f"{self.engine} 请求步骤超过上限")
         try:
             resp = await self.client.send(req, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            # 2026-11-09 实测：本机连 Yandex 约每 8–12 次有 1 次 TLS 握手超时，重连马上就好。
+            # 连接没建立，请求一个字节都没发出去，重试一次是安全的（不会重复上传）；再失败就照常报“连接失败”
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            try:
+                resp = await self.client.send(req, stream=True)
+            except Exception as exc2:  # noqa: BLE001
+                raise classify_exception(exc2) from None
         except Exception as exc:  # noqa: BLE001
             raise classify_exception(exc) from None
         try:
@@ -196,14 +209,22 @@ class _WebBase:
     label = ""
 
     def __init__(self, *, proxy: str = "", transport: httpx.AsyncBaseTransport | None = None,
-                 timeout: float = 40.0) -> None:
+                 timeout: float = 40.0, pacer: Pacer | None = None) -> None:
         self._proxy, self._transport, self._timeout = proxy, transport, timeout
         self.info = ProviderInfo(f"img_{self.engine}", f"img_{self.engine}", "slow", paid=False,
                                  zero_marginal_cost=True, has_dates=False, label=self.label,
                                  extra={"image": True, "web": True, "kinds": ["visual", "guess"]})
+        # D84：本机直接请求网页的引擎要节流（同一时间一个、两次之间隔几秒加随机、每小时上限）
+        self.pacer = pacer or Pacer(self.label, **WEB_DEFAULT)
 
-    async def search_image(self, jpeg: bytes, *, max_results: int = 5) -> list[ImageHit]:
-        s = _Session(self.label, self.hosts, proxy=self._proxy, transport=self._transport, timeout=self._timeout)
+    async def search_image(self, jpeg: bytes, *, max_results: int = 5, ready: Any = None) -> list[ImageHit]:
+        # R62-08：ready 由 ImageExecutor 传入，拿到名额、真正发请求前再查一次冷却
+        async with self.pacer.slot(ready):
+            return await self._search_paced(jpeg, max_results)
+
+    async def _search_paced(self, jpeg: bytes, max_results: int) -> list[ImageHit]:
+        s = _Session(self.label, self.hosts, proxy=self._proxy, transport=self._transport, timeout=self._timeout,
+                     pacer=self.pacer)
         try:
             with _private_logs():
                 return await asyncio.wait_for(self._search(s, jpeg, max_results), timeout=self._timeout + 20)
@@ -221,6 +242,16 @@ _YANDEX_STATE = re.compile(r'<div\b[^>]*\bid="ImagesApp-[^"]*"[^>]*>', re.S)
 _DATA_STATE = re.compile(r'\bdata-state="([^"]*)"', re.S)
 
 
+def _page_hint(page: str) -> str:
+    """页面结构不对时，附上页面“像什么”（标题、长度、有没有 ImagesApp），方便以后判断是改版、验证页还是空页。
+    只取页面自己的标题和长度，不含图片地址或 cbir_id。"""
+    t = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+    # R62-01：标题先脱敏再截断（标题里万一回显了已登记的 key，截断后就认不出来了）
+    title = _clip(redact(html.unescape(t.group(1)).strip()), 30) if t else "无标题"
+    apps = len(re.findall(r'id="ImagesApp-', page))
+    return f"标题“{title}”，{len(page) // 1024} KB，ImagesApp {apps} 个"
+
+
 def parse_yandex(page: str) -> tuple[list[dict], list[str]]:
     """从结果页取 (sites, tags)。结构变了就抛 SourceError（不伪造结果）。"""
     m = None
@@ -229,14 +260,14 @@ def parse_yandex(page: str) -> tuple[list[dict], list[str]]:
         if m:
             break
     if not m:
-        raise SourceError(Outcome.UNKNOWN, "Yandex 页面结构已变化（找不到 data-state）")
+        raise SourceError(Outcome.UNKNOWN, f"Yandex 页面结构已变化（找不到 data-state；{_page_hint(page)}）")
     try:
         state = json.loads(html.unescape(m.group(1)))
-    except ValueError:
+    except (ValueError, RecursionError):
         raise SourceError(Outcome.UNKNOWN, "Yandex 页面结构已变化（data-state 不是 JSON）") from None
     init = state.get("initialState") if isinstance(state, dict) else None
     if not isinstance(init, dict) or "cbirSites" not in init:
-        raise SourceError(Outcome.UNKNOWN, "Yandex 页面结构已变化（缺 cbirSites）")
+        raise SourceError(Outcome.UNKNOWN, f"Yandex 页面结构已变化（缺 cbirSites；{_page_hint(page)}）")
     sites = (init.get("cbirSites") or {}).get("sites") or []
     tags = [t.get("text") for t in ((init.get("cbirTags") or {}).get("tags") or []) if isinstance(t, dict)]
     return [x for x in sites if isinstance(x, dict)], [t for t in tags if isinstance(t, str) and t.strip()]

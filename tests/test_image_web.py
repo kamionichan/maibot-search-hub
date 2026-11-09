@@ -112,8 +112,43 @@ def test_plugin_builds_web_engines_by_config():
     from plugin import build_image_providers
     cfg = HubConfig()
     names = [p.info.name for p in build_image_providers(cfg, Http())]
-    assert names == ["tracemoe", "animetrace", "img_yandex", "img_bing"]
+    assert names == ["tracemoe", "animetrace", "img_yandex", "img_baidu", "img_bing"]   # 0.6.1：百度识图在 Yandex 后
     cfg.image.web_engines = "bing, nope"
     assert [p.info.name for p in build_image_providers(cfg, Http())][-1] == "img_bing"
     cfg.image.web_enabled = False
+    assert [p.info.name for p in build_image_providers(cfg, Http()) if p.info.extra.get("web")] == ["img_baidu"]  # 百度单独开关
+    cfg.image.baidu_enabled = False
     assert not any(p.info.extra.get("web") for p in build_image_providers(cfg, Http()))
+
+
+
+async def test_connect_timeout_retried_once(monkeypatch):
+    """2026-11-09：本机连 Yandex 偶发 TLS 握手超时。连接都没建立，重试一次；两次都失败才报连接失败。"""
+    import hub.image_web as W
+    monkeypatch.setattr(W.random, "uniform", lambda a, b: 0.0)
+    calls = {"n": 0}
+
+    def h(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectTimeout("handshake timed out")
+        return httpx.Response(200, text="ok")
+    s = W._Session("Yandex", frozenset({"yandex.com"}), transport=httpx.MockTransport(h))
+    st, _, text, _ = await s.send("GET", "https://yandex.com/images/")
+    assert st == 200 and text == "ok" and calls["n"] == 2
+    await s.aclose()
+
+    def always(req):
+        raise httpx.ConnectTimeout("handshake timed out")
+    s2 = W._Session("Yandex", frozenset({"yandex.com"}), transport=httpx.MockTransport(always))
+    with pytest.raises(SourceError) as ei:
+        await s2.send("GET", "https://yandex.com/images/")
+    assert ei.value.outcome is Outcome.NOT_SENT
+    await s2.aclose()
+
+
+def test_yandex_structure_error_says_what_page_it_was():
+    from hub.image_web import parse_yandex
+    with pytest.raises(SourceError) as ei:
+        parse_yandex("<html><head><title>Ой!</title></head><body>" + "x" * 3000 + "</body></html>")
+    assert "标题“Ой!”" in ei.value.message and "ImagesApp 0 个" in ei.value.message

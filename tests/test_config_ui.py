@@ -25,7 +25,7 @@ def test_every_section_in_a_tab_and_every_field_has_chinese_label():
     assert "sync_window_seconds" not in s["sections"]["search"]["fields"]
     assert set(tuning["fields"]) | set(s["sections"]["search"]["fields"]) == set(HubConfig().search.model_dump())
     img = [n for n, sec in s["sections"].items() if sec.get("name", n) == "image"]
-    assert sorted(img) == ["image", "image_anime", "image_container", "image_web"]
+    assert sorted(img) == ["image", "image_anime", "image_find", "image_lens", "image_pace", "image_web"]
     got = set().union(*(s["sections"][n]["fields"] for n in img))
     assert got == set(HubConfig().image.model_dump()), "以图搜字段拆分后不能丢"
     for n, sec in s["sections"].items():
@@ -58,16 +58,19 @@ def test_unfilled_keyed_sources_collapsed_and_badge():
     s = schema()
     assert s["sections"]["exa"]["collapsed"] is True and s["sections"]["search"]["collapsed"] is False
     assert s["sections"]["storage"]["collapsed"] is True
-    keyed = next(t for t in s["layout"]["tabs"] if t["id"] == "keyed")
+    keyed = next(t for t in s["layout"]["tabs"] if t["id"] == "sources")
     assert "badge" not in keyed
     cfg = HubConfig()
     cfg.exa.api_key = "x" * 20
     cfg.baidu.api_key = "y" * 20
     s2 = schema(cfg)
     assert s2["sections"]["exa"]["collapsed"] is False and s2["sections"]["brave"]["collapsed"] is True
-    assert s2["sections"]["image_container"]["collapsed"] is True
-    assert next(t for t in s2["layout"]["tabs"] if t["id"] == "keyed")["badge"] == "已填 2"
-    orders = [s2["sections"][n]["order"] for t in CONFIG_TABS for n in t[2] if n in s2["sections"]]
+    assert "image_container" not in s2["sections"]
+    src_tab = next(t for t in s2["layout"]["tabs"] if t["id"] == "sources")
+    assert src_tab["badge"] == "已填 Key 2"
+    # 免 Key 的在前，其次填了 Key 的，没填的最后
+    assert src_tab["sections"][:6] == ["keenable", "tavily", "host_web", "searxng", "baidu", "exa"]
+    orders = [s2["sections"][n]["order"] for t in s2["layout"]["tabs"] for n in t["sections"]]
     assert orders == sorted(orders)
 
 
@@ -118,3 +121,39 @@ def test_migrate_old_sources_still_works():
 
 def test_decorate_schema_tolerates_empty():
     assert decorate_schema({}, None) == {}
+
+
+def _visible(s):
+    return {(sec.get("name", n), k) for n, sec in s["sections"].items() for k, f in sec["fields"].items() if not f.get("hidden")}
+
+
+def test_rare_settings_hidden_unless_changed_or_show_all():
+    """D78：不常用的设置平时收起；改过的照常显示；打开“显示全部设置”后全部显示。值本身不受影响。"""
+    from hub.config import RARE_FIELDS
+    s = schema()
+    vis = _visible(s)
+    assert not (vis & RARE_FIELDS)
+    assert ("exa", "api_key") in vis and ("exa", "enabled") not in vis and ("exa", "daily_limit") not in vis
+    assert ("search", "sync_window_seconds") in vis and ("plugin", "show_all_settings") in vis
+    assert len(vis) <= 70
+    cfg = HubConfig()
+    cfg.exa.daily_limit = 10          # 改过 → 显示
+    cfg.brave.enabled = False         # 关掉过 → 显示，免得用户找不到开关
+    vis2 = _visible(schema(cfg))
+    assert ("exa", "daily_limit") in vis2 and ("brave", "enabled") in vis2 and ("baidu", "daily_limit") not in vis2
+    cfg.plugin.show_all_settings = True
+    vis3 = _visible(schema(cfg))
+    assert RARE_FIELDS <= vis3
+    # 所有设置都还在 schema 里（只是隐藏），保存时不会丢
+    allf = {(sec.get("name", n), k) for n, sec in s["sections"].items() for k in sec["fields"]}
+    assert RARE_FIELDS <= allf
+
+
+def test_tabs_layout_d78():
+    s = schema()
+    tabs = [(t["id"], t["title"]) for t in s["layout"]["tabs"]]
+    assert tabs == [("basic", "常用"), ("sources", "搜索来源"), ("image", "以图搜图"), ("advanced", "高级")]
+    basic = next(t for t in s["layout"]["tabs"] if t["id"] == "basic")["sections"]
+    assert basic == ["search", "verify"]
+    adv = next(t for t in s["layout"]["tabs"] if t["id"] == "advanced")["sections"]
+    assert "coexist" in adv and all(s["sections"][n]["collapsed"] for n in adv)

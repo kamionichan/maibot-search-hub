@@ -43,6 +43,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "插件"
     config_version: str = F("0.5.2", "配置结构版本", hidden=True)
     enabled: bool = F(True, "启用搜索中枢")
+    show_all_settings: bool = F(False, "显示全部设置", "打开后保存，再刷新页面")
 
 
 class SearchSection(PluginConfigBase):
@@ -51,7 +52,8 @@ class SearchSection(PluginConfigBase):
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
 
     allow_text_outbound: bool = F(True, "允许文字搜索", "关闭后，麦麦不会再把搜索词发给任何搜索服务（以图搜图另有开关）")
-    proxy: str = F("", "HTTP 代理", "文字搜索和 Yandex、Bing 都会走这个代理；留空直连", placeholder="例：http://127.0.0.1:7890")
+    proxy: str = F("", "HTTP 代理", "文字搜索、以图搜图、读原文、找图都会走这个代理（camofox 浏览器、麦麦联网服务除外）；"
+                   "服务器访问不了境外网站时填。留空直连", placeholder="例：http://127.0.0.1:7890")
     priority: str = F("", "优先使用的来源（可选）", "留空按问题的语言自动排序。填来源的英文名，用英文逗号分隔",
                       placeholder="例：baidu,exa")
     cache_enabled: bool = F(True, "缓存搜索结果", "短时间内问同样的问题，直接用上次的结果")
@@ -136,7 +138,7 @@ def _keyed(cls_name: str, label: str, doc: str, url: str, daily: int, extra: dic
         "__ui_label__": label,
         "__doc__": doc,
         "enabled": F(True, "启用", "填了 Key 就会使用，想暂时停用就关掉"),
-        "api_key": F("", "API Key", f"申请：{url}", secret=True),
+        "api_key": F("", "API Key", f"填了就启用。申请：{url}", secret=True),
         "daily_limit": F(daily, "每日上限（次）", "按免费额度折算，填 0 不限", ge=0, le=100000),
     }
     for k, (typ, fld) in (extra or {}).items():
@@ -209,10 +211,29 @@ class ImageSection(PluginConfigBase):
     saucenao_key: str = F("", "SauceNAO Key：插画出处", "填了才启用。免费注册：https://saucenao.com/user.php", secret=True)
     web_enabled: bool = F(True, "启用 Yandex、Bing", "不想让图片上传到这两个网站就关掉")
     web_engines: str = F("yandex,bing", "使用顺序", "可选 yandex、bing，用英文逗号分隔；只留一个就只用一个")
+    baidu_enabled: bool = F(True, "启用百度识图", "中文网页出处。图片会上传到百度；排在 Yandex 之后")
+    serpapi_key: str = F("", "SerpApi Key：Google Lens", "填了才启用。每月免费 250 次。申请：https://serpapi.com/users/sign_up",
+                         secret=True)
+    serpapi_daily_limit: int = F(8, "SerpApi 每日上限（次）", "每月 250 次 ≈ 每天 8 次；填 0 不限", ge=0, le=100000)
+    camofox_url: str = F("", "camofox 浏览器地址：Google Lens", "自己部署了 camofox-browser 才需要。没有 SerpApi 时用它查 Google Lens",
+                         placeholder="http://camofox:9377")
+    camofox_key: str = F("", "camofox Key（可选）", "启动 camofox 时设置了 CAMOFOX_ACCESS_KEY 或 CAMOFOX_API_KEY 才填（前者保护全部接口）", secret=True)
+    camofox_gap_seconds: int = F(60, "浏览器查 Lens 两次之间至少隔（秒）",
+                                 "另外再随机多等 0 到一半的时间；同一时间只开一个浏览器页面", ge=10, le=3600)
+    web_gap_seconds: int = F(5, "Yandex、百度识图、Bing 两次之间至少隔（秒）",
+                             "本机直接请求这几个网站，另外再随机多等 0 到同样长的时间；同一时间每个网站只查一次", ge=1, le=600)
+    web_rate_per_hour: int = F(30, "Yandex、百度识图、Bing 每小时上限（次）", "每个网站分别计；填 0 不限", ge=0, le=1000)
+    camofox_rate_per_hour: int = F(6, "浏览器查 Lens 每小时上限（次）",
+                                   "Google 连续查十几次就会要求验证，所以要限频；被要求验证后自动暂停 2 小时", ge=1, le=60)
+    find_enabled: bool = F(True, "按关键词找图（“给我发一张 XX 的图”）",
+                           "用 SearXNG 图片搜索（填了地址才有）和 Tavily 找图，下载几张交给麦麦挑着发。只发出搜索词，不上传图片")
+    find_safe: bool = F(False, "找图时过滤成人内容",
+                        "打开后 SearXNG 用严格安全搜索，并丢掉标题或网址明显是成人内容的图。真人照片不会被过滤")
+    find_count: int = F(2, "找图时交给麦麦的张数", "麦麦从中挑着发；越多越慢", ge=1, le=4)
+    attach_thumbnails: bool = F(True, "找到同一张图时附上缩略图",
+                                "让麦麦可以把找到的图发出来（最多 2 张，由麦麦决定发不发）；照片找人时不附")
     verify_dhash: bool = F(True, "下载候选图核对", "下载搜到的候选图，确认是不是同一张图")
-    container_url: str = F("", "容器地址", placeholder="http://picimagesearch-api:8080")
-    container_key: str = F("", "容器 Key", "容器的 PICSEARCH_API_KEY", secret=True)
-    container_engines: str = F("google_lens,baidu,tineye", "容器引擎的使用顺序", "用英文逗号分隔")
+    # 0.6.1（D77）：去掉“以图搜图容器”（container_url/key/engines）。旧配置里的这几项会被忽略（extra=ignore）。
 
 
 # ---------------------------------------------------------------- 高级
@@ -233,8 +254,10 @@ class VerifySection(PluginConfigBase):
     规则检查（乱码页面、明显过时、完全无关）始终进行，不调用模型。"""
     __ui_label__ = "结果核查"
     enabled: bool = F(True, "用模型核查搜索结果", "普通和深度搜索时，每次多调用一次下面的模型；快速搜索只做规则检查")
-    model_task: str = F("utils", "核查用的模型任务", "填麦麦「模型管理」里的任务名，建议用便宜、快的模型",
-                        placeholder="utils")
+    model_task: str = F("fast_model", "核查用的模型任务",
+                        "填麦麦「模型管理」里的任务名。默认 fast_model（快速模型，没配置时麦麦自动改用 utils）；"
+                        "不要用开着深度思考的模型，思考会占满输出、核查超时或为空",
+                        placeholder="fast_model")
     timeout_seconds: float = F(25.0, "核查超时（秒）", "超时只用规则检查的结果，不影响搜索。用推理模型时可能要调大", ge=3.0, le=60.0)
     use_chat_context: bool = F(True, "麦麦没写搜索目的时，参考最近几条聊天",
                                "麦麦写了“对方想弄清什么”时只用那一句；没写时才带上最近几条聊天。"
@@ -249,8 +272,8 @@ class ReplySection(PluginConfigBase):
 
 
 class StorageSection(PluginConfigBase):
-    """搜索记录保存在插件数据目录的 hub.sqlite3；不保存网页全文和图片。
-    0.5.2 去掉了“保存到磁盘”开关（D60）：旧配置里的 enabled 会被忽略（extra=ignore），记录始终保存。"""
+    """搜索记录保存在插件数据目录的 hub.sqlite3；不保存网页全文和图片。"""
+    # 0.5.2 去掉了“保存到磁盘”开关（D60）：旧配置里的 enabled 会被忽略（extra=ignore），记录始终保存。
     __ui_label__ = "搜索记录"
     keep_days: int = F(30, "搜索记录保留（天）", "S 编号对应的网址、标题、摘要，超过天数自动删除", ge=1, le=365)
     trace_keep_days: int = F(7, "调用轨迹保留（天）", ge=1, le=90)
@@ -312,13 +335,32 @@ def migrate_config(raw: Any) -> Any:
 
 
 # ---------------------------------------------------------------- WebUI 布局
+# 0.6.1（D78）整理配置页：四个标签页、平时收起不常用的设置。只改展示，TOML 结构不变（见 migrate_config 的说明）。
+FREE_SECTIONS = ("keenable", "tavily", "host_web", "searxng")
 CONFIG_TABS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("basic", "常用", ("search", "coexist")),
-    ("free", "免费来源", ("keenable", "tavily", "host_web", "searxng")),
-    ("keyed", "需要 Key 的来源", KEYED_SECTIONS),
-    ("image", "以图搜图", ("image", "image_anime", "image_web", "image_container")),
-    ("advanced", "高级", ("search_tuning", "read", "verify", "reply", "storage")),
+    ("basic", "常用", ("search", "verify")),
+    ("sources", "搜索来源", FREE_SECTIONS + KEYED_SECTIONS),
+    ("image", "以图搜图", ("image", "image_find", "image_anime", "image_web", "image_lens")),
+    ("advanced", "高级", ("coexist", "search_tuning", "read", "image_pace", "reply", "storage", "ui")),
 )
+
+# 平时收起的设置：(TOML 节, 字段)。值和默认值不同（改过）时照常显示；打开“显示全部设置”后全部显示。
+_KEYED_RARE = {(n, f) for n in KEYED_SECTIONS for f in ("enabled", "daily_limit")}
+RARE_FIELDS: frozenset[tuple[str, str]] = frozenset({
+    ("search", "cache_enabled"), ("search", "max_results_per_source"), ("search", "stale_minutes"),
+    ("search", "per_session_running"), ("search", "per_session_queue"), ("search", "deep_width"),
+    ("search", "subagent_sync_window_seconds"), ("search", "subagent_max_searches"),
+    ("coexist", "extra_tools"), ("coexist", "ignore_tools"),
+    ("tavily", "daily_limit"), ("host_web", "backend"), ("searxng", "enabled"), ("searxng", "engines"),
+    ("qwen", "base_url"), ("qwen", "model"),
+    ("image", "find_count"),
+    ("image", "tracemoe_key"), ("image", "animetrace_model"), ("image", "web_engines"), ("image", "verify_dhash"),
+    ("image", "serpapi_daily_limit"),
+    ("read", "use_host_fetch"), ("read", "use_fetch_url_plugin"), ("read", "excerpt_chars"),
+    ("read", "max_reads_per_turn"), ("read", "page_cache_minutes"),
+    ("verify", "timeout_seconds"), ("reply", "evidence_window_minutes"),
+    ("storage", "trace_keep_days"), ("storage", "per_session_entries"),
+} | _KEYED_RARE)
 
 
 TUNING_FIELDS = ("sync_window_seconds", "job_timeout_seconds", "stale_minutes", "per_session_running",
@@ -326,15 +368,21 @@ TUNING_FIELDS = ("sync_window_seconds", "job_timeout_seconds", "stale_minutes", 
                  "subagent_max_searches")
 # 配置页上的虚拟配置节：(虚拟节 id, 实际 TOML 节, 标题, 说明, 字段)。字段按两列排，相关的两项放在同一行。
 VIRTUAL_SECTIONS: tuple[tuple[str, str, str, str, tuple[str, ...]], ...] = (
-    ("search_tuning", "search", "等待与并发",
-     "什么时候把搜索转到后台、同时进行几个、深度搜索查多深。默认值已经实测过，一般不用改。", TUNING_FIELDS),
+    ("search_tuning", "search", "等待与读原文",
+     "什么时候把搜索转到后台、自动读几篇原文。默认值已经实测过，一般不用改。", TUNING_FIELDS),
+    ("image_find", "image", "按关键词找图", "对方说“发一张 XX 的图”时，用图片搜索找几张交给麦麦挑。图片来自网上，可能有水印或不完全对题。",
+     ("find_enabled", "find_safe", "find_count")),
     ("image_anime", "image", "二次元识别", "番剧截图、角色、插画出处。trace.moe 和 AnimeTrace 免 Key；SauceNAO 填了 Key 才用。",
      ("tracemoe_enabled", "tracemoe_key", "animetrace_enabled", "animetrace_model", "saucenao_key")),
-    ("image_web", "image", "相似图片（Yandex、Bing）", "照片、实物、相似图片。图片会上传到这两个网站。",
-     ("web_enabled", "web_engines")),
-    ("image_container", "image", "以图搜图容器（可选）",
-     "自己部署了 picimagesearch-api 才需要，用于 Google Lens、百度识图、TinEye。",
-     ("container_url", "container_key", "container_engines")),
+    ("image_web", "image", "相似图片与网页出处（Yandex、百度识图、Bing）", "照片、实物、相似图片。图片会上传到这几个网站。",
+     ("web_enabled", "web_engines", "baidu_enabled", "attach_thumbnails")),
+    ("image_lens", "image", "Google Lens（可选）", "填 SerpApi Key（稳定，每月 250 次免费）或 camofox 浏览器地址（免费，但要限频）。两个都填时优先用 SerpApi。",
+     ("serpapi_key", "serpapi_daily_limit", "camofox_url", "camofox_key")),
+    ("image_pace", "image", "以图搜图限速",
+     "本机直接访问网页（Yandex、百度识图、Bing）和用浏览器查 Google Lens 时的间隔与上限，防止被网站当成机器人拦截。"
+     "达到限制时这一步会跳过、换别的引擎，都用不了时如实告诉对方。默认值一般不用改。",
+     ("camofox_gap_seconds", "camofox_rate_per_hour", "web_gap_seconds", "web_rate_per_hour")),
+    ("ui", "plugin", "配置页", "不常用的设置平时收起（改过的照常显示）。", ("show_all_settings",)),
 )
 
 
@@ -344,7 +392,9 @@ def decorate_schema(schema: dict[str, Any], cfg: Any = None) -> dict[str, Any]:
     - [search] 里的等待与并发调校项拆成一个虚拟配置节 search_tuning，放到「高级」。前端按节的 `name`
       读写数据（dashboard `SectionRenderer`：resolvedSectionName = section.name || sectionName），
       所以虚拟节的 name 仍是 "search"，保存时写回 [search]。
-    - 没填 Key 的来源、没填地址的 SearXNG、「高级」里的节默认折叠；「需要 Key 的来源」标签显示已填数量。
+    - 没填 Key 的来源、没填地址的 SearXNG、「高级」里的节默认折叠；「搜索来源」标签显示已填 Key 的数量，
+      填了 Key 的排在没填的前面。
+    - RARE_FIELDS 里的设置平时收起（hidden），改过的照常显示；打开 plugin.show_all_settings 后全部显示。
     """
     if not isinstance(schema, dict) or not isinstance(schema.get("sections"), dict):
         return schema
@@ -369,22 +419,41 @@ def decorate_schema(schema: dict[str, Any], cfg: Any = None) -> dict[str, Any]:
             return bool(str(getattr(sec, "base_url", "")).strip())
         return bool(str(getattr(sec, "api_key", "")).strip())
 
+    show_all = bool(getattr(getattr(cfg, "plugin", None), "show_all_settings", False))
+    defaults = HubConfig()
+
+    def changed(real: str, key: str) -> bool:
+        if cfg is None:
+            return False
+        try:
+            return getattr(getattr(cfg, real), key) != getattr(getattr(defaults, real), key)
+        except AttributeError:
+            return False
+
+    if not show_all:
+        for sec in sections.values():
+            real = sec.get("name")
+            for key, f in (sec.get("fields") or {}).items():
+                if isinstance(f, dict) and (real, key) in RARE_FIELDS and not changed(real, key):
+                    f["hidden"] = True
+
     tabs = []
     order = 0
     for tab_order, (tab_id, title, names) in enumerate(CONFIG_TABS):
         present = [n for n in names if n in sections]
+        if tab_id == "sources":   # 免 Key 的在前，其次填了 Key 的，没填的最后（折叠）
+            present = ([n for n in present if n in FREE_SECTIONS] + [n for n in present if n not in FREE_SECTIONS and filled(n)]
+                       + [n for n in present if n not in FREE_SECTIONS and not filled(n)])
         for n in present:
             sections[n]["order"] = order
             order += 1
-            sections[n]["collapsed"] = (tab_id == "advanced" or (tab_id == "keyed" and not filled(n))
-                                        or (n == "searxng" and not filled(n))
-                                        or (n == "image_container" and not str(getattr(getattr(cfg, "image", None),
-                                                                                       "container_url", "")).strip()))
+            sections[n]["collapsed"] = (tab_id == "advanced" or (n in KEYED_SECTIONS and not filled(n))
+                                        or (n == "searxng" and not filled(n)))
         tab: dict[str, Any] = {"id": tab_id, "title": title, "sections": present, "order": tab_order}
-        if tab_id == "keyed":
-            n_filled = sum(filled(n) for n in present)
+        if tab_id == "sources":
+            n_filled = sum(filled(n) for n in present if n in KEYED_SECTIONS)
             if n_filled:
-                tab["badge"] = f"已填 {n_filled}"
+                tab["badge"] = f"已填 Key {n_filled}"
         tabs.append(tab)
     out["layout"] = {"type": "tabs", "tabs": tabs}
     return out

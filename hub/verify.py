@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from .merge import _parse_date, _terms, coverage
+from .net import redact
 
 # 结论
 DIRECT = "direct"      # 直接回答
@@ -44,6 +45,8 @@ class Review:
     checks: dict[int, Check] = field(default_factory=dict)   # sn -> Check
     gap: str = ""              # 模型写的“还缺什么”
     by_model: bool = False
+    conflict: bool = False     # D82：结果之间关键事实互相矛盾
+    model_sns: set[int] = field(default_factory=set)   # R61-27：模型实际给了判断的条目
     model_error: str = ""
     reads: dict[int, str] = field(default_factory=dict)      # sn -> ok / 读取失败原因（记进调用记录，供统计）
 
@@ -55,11 +58,24 @@ class Review:
         return any(c.verdict == DIRECT for c in self.checks.values())
 
     @property
+    def unchecked(self) -> list[int]:
+        """R61-27：交给了模型、但模型没返回判断的条目（规则也没判为无关/无效）。"""
+        if not self.by_model:
+            return []
+        return sorted(sn for sn, c in self.checks.items() if sn not in self.model_sns and c.verdict not in HIDDEN)
+
+    @property
+    def all_stale(self) -> bool:
+        """D80：有判定的条目全是“可能过时”（不算无关、无效），且至少有一条。"""
+        vs = [c.verdict for c in self.checks.values() if c.verdict not in HIDDEN]   # 没判定（规则通过）的算没过时
+        return bool(vs) and all(v == STALE for v in vs)
+
+    @property
     def all_hidden(self) -> bool:
         return bool(self.checks) and all(c.verdict in HIDDEN for c in self.checks.values())
 
     def summary(self) -> dict[str, Any]:
-        return {"model": self.by_model, "error": self.model_error[:80], "gap": self.gap[:120],
+        return {"model": self.by_model, "conflict": self.conflict, "error": self.model_error[:80], "gap": self.gap[:120],
                 "v": {str(sn): c.verdict for sn, c in self.checks.items() if c.verdict},
                 "reads": {str(sn): why[:40] for sn, why in self.reads.items()}}
 
@@ -81,15 +97,18 @@ def time_need(query: str, goal: str, freshness: str, intent: str, now: datetime 
     now = now or datetime.now(timezone.utc)
     if freshness == "today" or re.search(r"今天|今日|刚刚|刚才|今早|今晚", text):
         return TimeNeed(timedelta(hours=48), None, "今天")
-    years = [int(y) for y in _YEAR.findall(text) if 2000 <= int(y) <= now.year + 1]
+    # 年份只取“不晚于今年”的：问题里写“2026 2027”常常是在问下赛季/明年的计划，
+    # 发布日期不可能在未来，按 2027 判“过时”会把今天的新闻全打掉（1.4.3 测试实例实测）。
+    # 多个年份时取最早的一个作为下限，宁可少判过时。
+    years = sorted({int(y) for y in _YEAR.findall(text) if 2000 <= int(y) <= now.year})
     if re.search(r"本周|这周|昨天|昨晚|这两天|这几天", text):
         return TimeNeed(timedelta(days=10), None, "最近几天")
     if freshness == "recent" or intent == "news" or re.search(r"最新|最近|近期|现在|目前|如今|当前|新出|刚出", text):
-        return TimeNeed(timedelta(days=60), years[-1] if years else None, "最近")
+        return TimeNeed(timedelta(days=60), years[0] if years else None, "最近")
     if re.search(r"今年", text):
         return TimeNeed(None, now.year, "今年")
     if years:
-        return TimeNeed(None, max(years), f"{max(years)} 年")
+        return TimeNeed(None, years[0], f"{years[0]} 年")
     return TimeNeed()
 
 
@@ -97,14 +116,27 @@ def time_need(query: str, goal: str, freshness: str, intent: str, now: datetime 
 _DATE_PATTERNS = (
     re.compile(r"(?<!\d)(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?"),
 )
+# R61-05：只有带“发布/更新/发表于”这类说明的日期才当发布日期；正文里讲事件的日期（“于 2024-04-24 首发”）不算
+# R62-04：只认“元数据”写法——“发布时间：”“发表于：”“更新日期 ”“Published:”这类（带冒号，或“时间/日期”后直接跟日期）；
+# 正文句子里的“该版本发布于 2024 年……”“于 2024 年首发”不算，只作弱线索交给模型
+# R63-03：英文也要像元数据——字段名在行首（或分隔符 | · • 之后），后面跟冒号或“on/at”，再紧跟日期；
+# 句子里的“The version was published on 2024-04-24”不算（字段名前有别的词）
+_PUB_HINT = re.compile(r"(?:(发布|发表|更新|修改|编辑|上传)(时间|日期)\s*[:：]?|(发布|发表|更新|上传)于\s*[:：]|"
+                       r"(?:^|[\n|·•])\s*(?:date\s+)?(published|updated|posted|last\s+(?:modified|updated))"
+                       r"(?:\s*:|\s+(?:on|at)\s*:?))\s*$", re.I)
 
 
-def page_date(text: str) -> str | None:
-    """正文开头 1500 字里出现的最早一个合理日期（文章通常先写发布日期）。没有就返回 None。"""
+def page_date(text: str, *, strict: bool = True) -> str | None:
+    """正文开头 1500 字里的发布日期。strict（默认）只认前面紧跟“发布/更新于”等字样的日期；
+    strict=False 时退回“第一个合理日期”，只作弱线索（交给核查模型参考，规则不据此判过时）。"""
     head = text[:1500]
     now = datetime.now(timezone.utc)
     for pat in _DATE_PATTERNS:
         for m in pat.finditer(head):
+            # 往前看到上一行行首为止（最多 40 字），让行首判断能成立
+            start = max(0, m.start() - 40, head.rfind("\n", 0, m.start()))
+            if strict and not _PUB_HINT.search(head[start:m.start()]):
+                continue
             try:
                 d = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc)
             except ValueError:
@@ -115,8 +147,14 @@ def page_date(text: str) -> str | None:
 
 
 _GARBLED_TITLE = re.compile(r"^\s*[\[{]\s*\\?\"|\\\"|^\s*(null|undefined|none)\s*$|^\s*\W{0,3}\s*$", re.I)
-_WALL = re.compile(r"(请|需要)?(先)?登录(后)?(查看|继续|才能)|扫码登录|验证码|访问过于频繁|人机验证|"
-                   r"enable javascript|verify you are human|access denied|403 forbidden|captcha", re.I)
+_WALL = re.compile(r"(请|需要)?(先)?登录(后)?(查看|继续|才能)|扫码登录|输入验证码|请完成验证|访问过于频繁|人机验证|"
+                   r"enable javascript|verify you are human|access denied|403 forbidden|complete the captcha", re.I)
+# “讲解”特征：要有讲解的说法（原因/解决/处理方法/步骤/教程/如何…）或者命令、配置这类技术内容，单个通用词不算
+_EXPLAINS = re.compile(r"原因|解决(办法|方法)?|处理方法|怎么(办|处理|解决|关闭|设置)|如何(处理|解决|关闭|设置|配置)|步骤|教程|排查|"
+                       r"\bhow to\b|\bsolutions?\b|\bcauses?\b|\bfix(es|ed)?\b|\bsteps?\b|"
+                       r"nginx -s|systemctl|chmod |sudo |\.conf\b|`[^`]+`", re.I)
+# R61-04：讨论“验证码”“403”的正常教程不算验证页。只有页面短、且提示出现在开头（阻拦页一般一上来就是提示）时才判无效
+_WALL_HEAD = 160
 
 
 def invalid_reason(title: str, snippet: str, body: str | None) -> str:
@@ -127,8 +165,12 @@ def invalid_reason(title: str, snippet: str, body: str | None) -> str:
         b = body.strip()
         if len(b) < 60 and len((snippet or "").strip()) < 30:
             return "页面几乎没有正文"
-        if len(b) < 400 and _WALL.search(b):
-            return "页面要求登录或验证"
+        if len(b) < 400:
+            m = _WALL.search(b)
+            # R62-03：讲“403 / Access denied / 人机验证怎么处理”的正常教程也很短、开头也有这些词。
+            # 有讲解特征（原因、解决、方法、步骤、命令、代码）时不判无效，交给模型
+            if m and (m.start() < _WALL_HEAD or len(b) < 120) and not _EXPLAINS.search(b):
+                return "页面要求登录或验证"
     return ""
 
 
@@ -137,22 +179,23 @@ def rule_check(query: str, need: TimeNeed, *, title: str, snippet: str, body: st
                published_at: str | None, now: datetime | None = None) -> Check:
     now = now or datetime.now(timezone.utc)
     bad = invalid_reason(title, snippet, body)
-    pd = page_date(body) if body else None
+    pd = page_date(body) if body else None                        # 明确写了“发布/更新于”的
+    weak = pd or (page_date(body, strict=False) if body else None)  # 只作线索，交给核查模型
     if bad:
-        return Check(INVALID, bad, "rule", pd)
-    # 发布日期：来源给的优先，没有就用正文里找到的
+        return Check(INVALID, bad, "rule", weak)
+    # 发布日期：来源给的优先，其次正文里明确标了“发布/更新于”的；正文里其他日期不据此判过时（R61-05）
     date_s = published_at or pd
     d = _parse_date(date_s) if date_s else None
     if d is not None:
         skew = timedelta(hours=36)
         if need.window is not None and now - d > need.window + skew:
-            return Check(STALE, f"发布于 {d:%Y-%m-%d}，问题要{need.label}的内容", "rule", pd)
+            return Check(STALE, f"发布于 {d:%Y-%m-%d}，问题要{need.label}的内容", "rule", weak)
         if need.year is not None and d.year < need.year:
-            return Check(STALE, f"发布于 {d:%Y-%m-%d}，问题问的是 {need.year} 年", "rule", pd)
+            return Check(STALE, f"发布于 {d:%Y-%m-%d}，问题问的是 {need.year} 年", "rule", weak)
     text = f"{title} {snippet} {body or ''}"
     if _terms(query) and coverage(query, text) == 0:
-        return Check(OFF, "与问题的关键词都对不上", "rule", pd)
-    return Check("", "", "", pd)
+        return Check(OFF, "与问题的关键词都对不上", "rule", weak)
+    return Check("", "", "", weak)
 
 
 # ---------------- 模型核查 ----------------
@@ -184,9 +227,24 @@ def build_prompt(query: str, goal: str, chat: str, need: TimeNeed, today: str,
         "对每条给出 v：direct=内容直接回答了问题；partial=相关但只回答了一部分；stale=内容是旧的，"
         "不符合时间要求或已被更新的情况取代；off=讲的是别的事（哪怕关键词一样）；invalid=页面坏了或没有实际内容。"
         "r 用不超过 20 字说明依据（例如“讲的是 2022 年的比赛，不是分裂”）。"
+        "注意：标题写着“官方公告”“官宣”，但发布者是个人账号、自媒体或转载（不是当事机构自己的账号或官网）时，"
+        "只能判 partial，r 写“发布者不是官方”。"
+        "几条结果在关键事实上说法互相矛盾时（例如一条说已官宣解散、另一条说官方没有发公告），把 conflict 设为 true，"
+        "有冲突的条目都不能判 direct，在 gap 里写清矛盾在哪。"
         "gap 写综合所有结果后问题还缺什么（都回答了就写空字符串），不超过 30 字。"
-        '格式：{"items":[{"sn":3,"v":"direct","r":"..."}],"gap":"..."}')
+        '格式：{"items":[{"sn":3,"v":"direct","r":"..."}],"conflict":false,"gap":"..."}')
     return "\n".join(lines)
+
+
+class Gap(str):
+    """模型写的“还缺什么”；D82：附带 conflict（结果之间关键事实互相矛盾）。仍可当普通字符串用。"""
+    conflict: bool = False
+
+    @classmethod
+    def of(cls, text: str, conflict: bool) -> "Gap":
+        g = cls(text)
+        g.conflict = conflict
+        return g
 
 
 def parse_reply(text: str, sns: set[int]) -> tuple[dict[int, Check], str]:
@@ -208,19 +266,34 @@ def parse_reply(text: str, sns: set[int]) -> tuple[dict[int, Check], str]:
             out[sn] = Check(v, str(it.get("r") or "")[:40], "model")
     if not out:
         raise ValueError("模型输出里没有可用的判断")
-    return out, str(data.get("gap") or "")[:60]
+    conflict = data.get("conflict") is True or str(data.get("conflict")).lower() == "true"
+    if conflict:
+        # D82：说法互相矛盾时不留“直接回答”——模型漏改的也降为部分相关
+        out = {sn: (Check(PARTIAL, c.reason or "与其他结果矛盾", c.by, c.page_date) if c.verdict == DIRECT else c)
+               for sn, c in out.items()}
+    return out, Gap.of(str(data.get("gap") or "")[:60], conflict)
 
 
 async def model_check(generate: Generate, prompt: str, sns: set[int], *, task: str, timeout: float,
                       ) -> tuple[dict[int, Check], str]:
-    res = await asyncio.wait_for(
-        # 推理模型的思考过程也算在 max_tokens 里：600 会被思考用完、正文为空（测试实例 deepseek-v4.1-flash 实测）
-        generate(prompt, task_name=task, temperature=0.1, max_tokens=2000, timeout_ms=int(timeout * 1000) + 5000),
-        timeout=timeout)
-    if not isinstance(res, dict) or not res.get("success", False):
-        err = res.get("error") if isinstance(res, dict) else res
-        raise ValueError(f"模型调用失败：{str(err)[:60]}")
-    return parse_reply(str(res.get("response") or ""), sns)
+    """推理模型的思考过程也算在 max_tokens 里：600 会被思考用完、正文为空（测试实例 deepseek-v4.1-flash 实测）。
+    2000 仍偶尔为空（思考很长时）：这时用剩余时间以 4000 再请求一次；正文仍为空就放弃，只用规则结果。"""
+    t0 = asyncio.get_running_loop().time()
+    last = ""
+    for max_tokens in (2000, 4000):
+        left = timeout - (asyncio.get_running_loop().time() - t0)
+        if left < 3:
+            break
+        res = await asyncio.wait_for(
+            generate(prompt, task_name=task, temperature=0.1, max_tokens=max_tokens, timeout_ms=int(left * 1000) + 5000),
+            timeout=left)
+        if not isinstance(res, dict) or not res.get("success", False):
+            err = res.get("error") if isinstance(res, dict) else res
+            raise ValueError(f"模型调用失败：{redact(str(err))[:60]}")     # R61-01：先脱敏再截断
+        last = str(res.get("response") or "")
+        if last.strip():
+            return parse_reply(last, sns)
+    return parse_reply(last, sns)
 
 
 def merge_checks(rule: dict[int, Check], model: dict[int, Check]) -> dict[int, Check]:
@@ -242,7 +315,8 @@ _MSG = re.compile(r"<message\b([^>]*)>(.*?)(?=<message\b|\Z)", re.S)
 
 
 def chat_context(items: list[Any], limit: int = 6, max_chars: int = 600) -> str:
-    """从 Planner 请求的历史里取最近几条聊天，发言人只标“你/对方”，不带昵称、QQ 号、消息编号。"""
+    """从 Planner 请求的历史里取最近几条聊天，发言人只标“你/对方”；去掉消息里的 @昵称和 5–13 位长数字。
+    这不是完整的匿名化：正文里直接写出的名字、地址等仍会保留（README 写明）。"""
     texts: list[str] = []
     for it in items or []:
         if not isinstance(it, dict):
@@ -254,7 +328,9 @@ def chat_context(items: list[Any], limit: int = 6, max_chars: int = 600) -> str:
         for m in _MSG.finditer(t):
             attrs, body = m.group(1), m.group(2)
             body = re.sub(r"<[^>]+>", " ", body)
-            body = re.sub(r"\b\d{5,12}\b", "#", body)          # QQ 号、手机号等长数字
+            # R61-23：用“前后不是数字”判断边界——\b 在汉字和数字之间不成立，“电话13800138000”会漏掉
+            body = re.sub(r"(?<!\d)\d{5,13}(?!\d)", "#", body)    # QQ 号、手机号等长数字
+            body = re.sub(r"@\S{1,20}", "@某人", body)                 # 正文里 @ 的昵称
             body = " ".join(body.split())
             if not body:
                 continue

@@ -159,7 +159,13 @@ def stage(dest: Path) -> None:
     for f in sorted(files):
         (dest / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / f, dest / f)
-    (dest / ".gitignore").write_text(PUBLIC_GITIGNORE, encoding="utf-8")
+    gi = dest / ".gitignore"
+    if gi.is_symlink() or (gi.exists() and not gi.is_file()):
+        # R61-22：.gitignore 是生成项，清理时跳过了它；是链接就先删掉，免得写到目标目录外
+        if gi.is_dir() and not gi.is_symlink():
+            raise SystemExit("发布目录里的 .gitignore 是一个目录，请先手动处理")
+        gi.unlink()
+    gi.write_text(PUBLIC_GITIGNORE, encoding="utf-8")
     leftover = scan({p.relative_to(dest).as_posix(): p.read_bytes()
                      for p in dest.rglob("*") if p.is_file() and ".git" not in p.relative_to(dest).parts})
     if leftover:

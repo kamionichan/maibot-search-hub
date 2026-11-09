@@ -75,3 +75,16 @@ def test_release_scan_catches_private_info():
     sample = ("see " + "/ro" + "ot/workspace/x and " + ".lo" + "cal/testbed/y").encode()
     found = release.scan({"a.md": sample})
     assert len(found) == 2
+
+
+def test_r61_22_stage_does_not_follow_gitignore_symlink(tmp_path):
+    sys.path.insert(0, str(ROOT / "tools"))
+    import release
+    dest = tmp_path / "public"
+    (dest / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("sentinel", encoding="utf-8")
+    (dest / ".gitignore").symlink_to(outside)
+    release.stage(dest)
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+    assert not (dest / ".gitignore").is_symlink() and (dest / ".gitignore").read_text(encoding="utf-8").startswith(".venv")

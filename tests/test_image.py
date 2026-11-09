@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 from hub.health import Health
 from hub.image import ImageInputError, dhash_bytes, hamming, prepare_image
 from hub.image_exec import ImageExecutor, make_image_plan
-from hub.image_sources import AnimeTraceProvider, ContainerImageProvider, SauceNaoProvider, TraceMoeProvider
+from hub.image_sources import AnimeTraceProvider, SauceNaoProvider, TraceMoeProvider
 from hub.net import Http, Outcome, SourceError
 
 
@@ -187,34 +187,12 @@ async def test_saucenao_errors():
     assert ei.value.status == 429
 
 
-async def test_container_request_and_errors():
-    seen = {}
-
-    def h(req):
-        seen["auth"], seen["body"] = req.headers["authorization"], json.loads(req.content)
-        return httpx.Response(200, json={"engine": "yandex", "candidates": [
-            {"title": "页面", "url": "https://example.org/p", "source": "example.org", "match_type": "source_candidate"},
-            {"title": "", "url": "javascript:x", "source": "", "match_type": "visual"}]})
-
-    p = ContainerImageProvider(http_with(h), "http://pic:8080/", "secret", "yandex")
-    hits = await p.search_image(b"img")
-    assert seen["auth"] == "Bearer secret" and seen["body"]["engine"] == "yandex" and seen["body"]["max_results"] == 5
-    assert len(hits) == 1 and hits[0].level == "weak" and p.info.name == "imgc_yandex"
-    for status, body, check in [(429, {"error": "busy"}, lambda e: e.retry_after),
-                                (502, {"error": "search_failed", "reason": "access_limited"}, lambda e: e.outcome is Outcome.REJECTED),
-                                (502, {"error": "search_failed", "reason": "parse_failed"}, lambda e: e.outcome is Outcome.UNKNOWN),
-                                (401, {"error": "unauthorized"}, lambda e: e.auth_failed)]:
-        with pytest.raises(SourceError) as ei:
-            await ContainerImageProvider(http_with(lambda r, s=status, b=body: httpx.Response(s, json=b)), "http://pic", "k", "bing").search_image(b"x")
-        assert check(ei.value), status
-
-
 # ---------------- 编排 ----------------
 class FakeImg:
-    def __init__(self, name, hits=None, error=None, container=False, delay=0.0, web=False):
+    def __init__(self, name, hits=None, error=None, delay=0.0, web=False):
         from hub.providers import ProviderInfo
         self.info = ProviderInfo(name, name, "medium", False, True, False,
-                                 extra={"image": True, "container": container, "web": web})
+                                 extra={"image": True, "web": web})
         self.hits, self.error, self.calls, self.delay = hits or [], error, 0, delay
 
     async def search_image(self, jpeg, *, max_results=3):
@@ -236,15 +214,15 @@ class Prep:
 
 def test_routes_by_intent():
     ps = [FakeImg("tracemoe"), FakeImg("saucenao"), FakeImg("animetrace"), FakeImg("img_yandex", web=True),
-          FakeImg("img_bing", web=True), FakeImg("imgc_google_lens", container=True)]
+          FakeImg("img_bing", web=True)]
     names = lambda plan: [p.info.name for p in plan.steps]
     assert names(make_image_plan(ps, Health(), depth="normal", intent="identify_scene", image=Prep())) == [
         "tracemoe", "saucenao", "img_yandex"]
     assert names(make_image_plan(ps, Health(), depth="normal", intent="identify_character", image=Prep()))[0] == "animetrace"
     assert names(make_image_plan(ps, Health(), depth="normal", intent="identify_person", image=Prep())) == [
-        "img_yandex", "img_bing", "imgc_google_lens"]
+        "img_yandex", "img_bing"]
     assert names(make_image_plan(ps, Health(), depth="deep", intent="auto", image=Prep())) == [
-        "saucenao", "tracemoe", "img_yandex", "animetrace", "img_bing", "imgc_google_lens"]
+        "saucenao", "tracemoe", "img_yandex", "animetrace", "img_bing"]
     assert names(make_image_plan(ps, Health(), depth="quick", intent="auto", image=Prep())) == ["saucenao"]
     with pytest.raises(SourceError) as ei:
         make_image_plan(ps[:3], Health(), depth="normal", intent="similar_image", image=Prep())
@@ -268,7 +246,7 @@ async def test_no_hit_marks_missing_image_weak():
     assert r.missing == ["image_weak"] and "[弱线索" in r.results[0].snippet
 
 
-async def test_container_candidates_verified_by_dhash():
+async def test_web_candidates_verified_by_dhash():
     src = synth()
     target = prepare_image(src)
     same = scaled(src, 200, 150)
@@ -280,7 +258,7 @@ async def test_container_candidates_verified_by_dhash():
                 raise SourceError(Outcome.NOT_SENT, "连接失败")
             return same if "same" in url else other
 
-    cont = FakeImg("imgc_google_lens", container=True, hits=[ih("weak", "https://cdn.example.com/same.jpg", kind="visual"),
+    cont = FakeImg("img_yandex", web=True, hits=[ih("weak", "https://cdn.example.com/same.jpg", kind="visual"),
                                                         ih("weak", "https://cdn.example.com/other.png", kind="visual"),
                                                         ih("weak", "https://cdn.example.com/fail.jpg", kind="visual")])
 

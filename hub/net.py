@@ -10,7 +10,8 @@
   只接受一层 gzip/deflate；超限立即停止，不会先解开整个压缩炸弹再检查。
   错误响应体不读，或只读一小段（以图搜接口需要业务码时）。
 - proxy 留空 = 直连，不继承环境变量里的代理（trust_env=False），与配置页说明一致。
-- 上游返回的文字（错误信息等）在进入模型、账本、trace 前经 redact() 脱敏：已配置的 key 与 URL 里的凭据参数。
+- 上游返回的**报错文字**在进入模型、账本、trace、日志前经 redact() 脱敏：已配置的 key 与 URL 里的凭据参数。
+  0.6.1（D83）：搜到的公开内容（标题、摘要、网页正文、网址）不再改写——会误伤正常内容，也没有遮挡的意义。
 """
 
 from __future__ import annotations
@@ -158,12 +159,18 @@ class _Inflater:
     def __init__(self, encoding: str) -> None:
         self._gzip = encoding == "gzip"
         self._d: Any = zlib.decompressobj(zlib.MAX_WBITS | 16) if self._gzip else None
+        self._head = b""          # R61-20：deflate 要看前 2 字节才能判断格式；首块可能只有 1 字节，先攒着
 
     def feed(self, data: bytes, room: int) -> Iterator[bytes]:
         """解压 data，每步最多 _STEP 字节；累计输出超过 room 时，多产出至多 1 字节后停止（调用方据此判断超限）。"""
         if self._d is None:
+            data = self._head + data
+            if len(data) < 2:
+                self._head = data
+                return
+            self._head = b""
             # zlib 封装：CMF 低 4 位为 8（deflate），且 (CMF*256+FLG) % 31 == 0
-            zlib_wrapped = len(data) >= 2 and (data[0] & 0x0F) == 8 and ((data[0] << 8) | data[1]) % 31 == 0
+            zlib_wrapped = (data[0] & 0x0F) == 8 and ((data[0] << 8) | data[1]) % 31 == 0
             self._d = zlib.decompressobj() if zlib_wrapped else zlib.decompressobj(-zlib.MAX_WBITS)
         d = self._d
         buf = data
@@ -181,6 +188,14 @@ class _Inflater:
                 break
 
     def flush(self, room: int) -> bytes:
+        if self._d is None and self._head:
+            # 整个响应只有 1 字节：按裸 deflate 解（解不出来会在下面报“不完整”）
+            self._d = zlib.decompressobj(-zlib.MAX_WBITS)
+            out = self._d.decompress(self._head, max(1, room + 1))
+            self._head = b""
+            if not self._d.eof:
+                raise zlib.error("incomplete compressed stream")
+            return out
         if self._d is None or self._d.eof:
             return b""
         tail = self._d.flush()[: max(0, room + 1)]
@@ -328,7 +343,7 @@ class Http:
             raise classify_exception(exc) from None
         try:
             return json.loads(data)
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):   # R62-15：深层嵌套的 JSON 也算无效
             raise SourceError(Outcome.UNKNOWN, "无效 JSON") from None
 
     async def post_raw(self, url: str, *, content: bytes | None = None, json_body: Any = None, files: Any = None,
@@ -352,5 +367,5 @@ class Http:
             raise classify_exception(exc) from None
         try:
             return status, (json.loads(body) if body else None)
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             return status, None

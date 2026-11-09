@@ -76,6 +76,10 @@ class Budget:
             return False, f"今日调用已达上限（{self.daily[info.name]} 次）"
         return True, ""
 
+    def count(self, name: str) -> None:
+        """D81：不走 SearchBudget 的单次调用（找图用的 Tavily）也计入该来源当日次数。"""
+        self._add(self._key(name), 1)
+
     def charge(self, info: Any, sb: SearchBudget) -> None:
         if not info.paid:
             return

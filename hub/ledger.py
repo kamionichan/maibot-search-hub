@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from .merge import Merged
-from .net import redact
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS entries (
@@ -96,7 +95,7 @@ class Ledger:
             for m in results:
                 # 0.5.6（B2）：所有结果都经过这里才进入账本、卡片和回复参考资料，标题和摘要在此脱敏。
                 # 网址原样保存（读取原文要用）；展示时由 cards 去掉凭据参数。
-                title, snippet = redact(m.title), redact(m.snippet)
+                title, snippet = m.title, m.snippet     # 0.6.1：搜到的公开内容原样保存（用户决定，见 D83）
                 row = cur.execute("SELECT sn, hits FROM entries WHERE session_id=? AND url_key=?",
                                   (session_id, m.key)).fetchone()
                 if row:
@@ -141,8 +140,11 @@ class Ledger:
                 "sources": json.loads(row[5] or "[]"), "first_seen": row[6]}
 
     def recent(self, session_id: str, since: float, limit: int = 6) -> list[dict[str, Any]]:
+        # R61-06：先把“没过时、没判无效/无关”的排前面，再按时间取前几条——否则一批旧结果会把同一时间窗里的新结果挤出去
+        # R62-05：判了“无关/无效”的本来就不进参考资料，在 LIMIT 之前就排除掉，免得它们占名额、把旧背景挤掉
         rows = self._db.execute("SELECT sn, url, title, snippet, published_at, last_seen, verdict FROM entries"
-                                " WHERE session_id=? AND last_seen>=? ORDER BY last_seen DESC, sn ASC LIMIT ?",
+                                " WHERE session_id=? AND last_seen>=? AND COALESCE(verdict, '') NOT IN ('off','invalid')"
+                                " ORDER BY CASE WHEN verdict='stale' THEN 1 ELSE 0 END, last_seen DESC, sn ASC LIMIT ?",
                                 (session_id, since, limit)).fetchall()
         keys = ("sn", "url", "title", "snippet", "published_at", "last_seen", "verdict")
         return [dict(zip(keys, r)) for r in rows]
@@ -155,9 +157,9 @@ class Ledger:
         return [{"job_id": r[0], "query": r[1], "sns": json.loads(r[2] or "[]"), "finished": r[3]} for r in rows]
 
     def set_page(self, session_id: str, sn: int, excerpt_text: str) -> None:
-        """读过正文：用正文摘录替换较短的摘要，并计一次“读取”。0.5.6：摘录脱敏；读取次数单独计（reads），
+        """读过正文：用正文摘录替换较短的摘要，并计一次“读取”。读取次数单独计（reads），
         不再混进 used（used 只表示“进了回复参考资料”的次数）。"""
-        ex = redact(excerpt_text)[:600]
+        ex = excerpt_text[:600]
         self._db.execute("UPDATE entries SET snippet=CASE WHEN length(?)>length(snippet) THEN ? ELSE snippet END,"
                          " reads=reads+1 WHERE session_id=? AND sn=?", (ex, ex, session_id, sn))
 

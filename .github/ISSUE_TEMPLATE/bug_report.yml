@@ -12,7 +12,7 @@ body:
     attributes:
       label: 版本
       description: 插件版本、MaiBot 版本（WebUI 插件管理页能看到）
-      placeholder: "插件 0.6.0，MaiBot 1.4.1"
+      placeholder: "插件 0.6.1，MaiBot 1.4.3；服务器在国内/境外，是否填了代理"
     validations:
       required: true
   - type: textarea

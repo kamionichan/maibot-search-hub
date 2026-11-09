@@ -46,6 +46,7 @@ class Job:
     goal: str = ""                    # D72：模型写的“对方想弄清什么”（只给核查模型，不发给搜索服务）
     chat: str = ""                    # D72：发起搜索时最近几条聊天（同上）
     review: Any = None                # D72：verify.Review（读正文后的核查结论）
+    enriching: bool = False           # R61-02：搜索已返回、正在读原文/核查——仍算在途
 
     def row(self) -> dict[str, Any]:
         return {
@@ -92,11 +93,15 @@ class JobManager:
         self._closing = False
 
     # ---- 查询 ----
+    @staticmethod
+    def _live(j: Job) -> bool:
+        return j.status in ("queued", "running") or j.enriching
+
     def active(self, session_id: str) -> list[Job]:
-        return [j for j in self._jobs.values() if j.session_id == session_id and j.status in ("queued", "running")]
+        return [j for j in self._jobs.values() if j.session_id == session_id and self._live(j)]
 
     def all_active(self) -> list[Job]:
-        return [j for j in self._jobs.values() if j.status in ("queued", "running")]
+        return [j for j in self._jobs.values() if self._live(j)]
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -126,6 +131,78 @@ class JobManager:
             job.owner = "background"
         return job
 
+    async def run_tracked(self, job: Job, make: Callable[[], Awaitable[Any]], *, ok: Callable[[Any], bool] = bool,
+                          deadline: float | None = None) -> Any:
+        """R61-11：同步执行但要登记为在途任务的工作（找图）。计入会话准入、可被 /search cancel 取消、
+        卸载时一起取消并等待。结果直接返回给调用方，不走后台送回。
+
+        R62-12：和后台搜索一样经过会话信号量（同时运行数），排队时间算在 deadline 里；
+        R62-15：异常照实记为 failed（不再被 finally 改成 finished）；
+        R62-16：开始和结束都写 jobs 表，/search jobs 能看到。
+        同一查询正在进行时，调用方用 wait_tracked() 等它的结果，不再另开一次。"""
+        self._evict_finished()
+        self._jobs[job.job_id] = job
+        job.status = "queued"
+        job.owner = "sync"
+        self.ledger.save_job(job.row())
+        sem = self._sem.setdefault(job.session_id, asyncio.Semaphore(self.per_running))
+
+        async def body() -> Any:
+            async with sem:
+                job.status = "running"
+                self.ledger.save_job(job.row())
+                return await make()
+        job.task = asyncio.ensure_future(body())
+        try:
+            if deadline is None:
+                res = await job.task
+            else:
+                res = await asyncio.wait_for(asyncio.shield(job.task), timeout=max(0.1, deadline - time.monotonic()))
+            job.status = "finished" if ok(res) else "failed"
+            return res
+        except asyncio.TimeoutError:
+            job.task.cancel()
+            await asyncio.gather(job.task, return_exceptions=True)
+            job.status = "timed_out"
+            raise
+        except asyncio.CancelledError:
+            job.task.cancel()
+            await asyncio.gather(job.task, return_exceptions=True)
+            job.status = "interrupted" if self._closing else "cancelled"
+            raise
+        except Exception:
+            job.status = "failed"
+            raise
+        finally:
+            if job.status in ("queued", "running"):
+                job.status = "failed"
+            try:
+                self.ledger.save_job(job.row())
+                # R63-08：卸载打断（interrupted）的没有把结果交给任何人，不能标“已送回”，重启后要能提示中断。
+                # 正常完成、失败、超时、被手动取消的都已经同步返回给调用方，标已送回
+                if job.status != "interrupted":
+                    self.ledger.mark_delivered(job.job_id, 1)
+            except Exception:  # noqa: BLE001 - 卸载时账本可能已关
+                pass
+
+    async def wait_tracked(self, job: Job, timeout: float) -> Any:
+        """R62-12：同一查询的找图已经在进行——等它的结果（共享），不另开一次。超时或它失败时返回 None。
+
+        R63-04：被共享的那个任务自己被取消（有人 /search cancel、它排队超时）时，等待者不能跟着抛 CancelledError——
+        等待者本身没被取消，应该拿到“没结果”的受控返回。只有等待者自己被取消时才往外抛。"""
+        if job.task is None:
+            return None
+        task = job.task
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, timeout))
+        except asyncio.CancelledError:
+            cur = asyncio.current_task()
+            if task.done() and not (cur is not None and cur.cancelling()):
+                return None              # 是被共享的任务结束了（被取消），不是我被取消
+            raise
+        except Exception:  # noqa: BLE001 - 超时或对方失败
+            return None
+
     async def wait_existing(self, job: Job, window: float) -> bool:
         """合并到已有任务：等待最多 window 秒，返回是否已完成。"""
         if job.task is None:
@@ -134,7 +211,7 @@ class JobManager:
         return job.task.done()
 
     def _evict_finished(self) -> None:
-        done = [k for k, j in self._jobs.items() if j.status not in ("queued", "running")]
+        done = [k for k, j in self._jobs.items() if not self._live(j)]
         for k in done[: max(0, len(done) - MAX_FINISHED)]:
             self._jobs.pop(k, None)
 
@@ -175,10 +252,15 @@ class JobManager:
                 job.entries = self.ledger.record(job.session_id, job.result.results)
                 # D72：所有文字搜索都核查（quick 只做规则，不读正文）；以图搜不走这里
                 if self.enrich is not None and job.status == "finished" and not job.image_hash:
+                    job.enriching = True
                     try:
                         await asyncio.wait_for(self.enrich(job), timeout=self.enrich_timeout)
                     except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - 读正文失败不影响搜索结果
-                        pass
+                        # R61-09：enrich 会先存规则核查结果；这里只标记“没核查完”，卡片据此降级提示
+                        if job.review is not None and not job.review.by_model and not job.review.model_error:
+                            job.review.model_error = "核查超时"
+                    finally:
+                        job.enriching = False
         except asyncio.CancelledError:
             # 卸载打断 → interrupted（下次加载时告知）；用户 /search cancel → cancelled
             job.status = "interrupted" if self._closing else "cancelled"
@@ -253,7 +335,7 @@ class JobManager:
         job = self._jobs.get(job_id)
         if job is None or job.session_id != session_id:
             return f"本会话没有任务 {job_id}"
-        if job.status not in ("queued", "running") or job.task is None:
+        if not self._live(job) or job.task is None or job.task.done():
             return f"{job_id} 已经结束（{job.status}）"
         job.task.cancel()
         return f"已取消 {job_id}。已发出的请求不会追回，已拿到的结果仍保留在记录里。"

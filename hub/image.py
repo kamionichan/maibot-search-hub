@@ -4,7 +4,7 @@
   模型给的是消息编号或短别名，Host 负责展开（HOST_FACTS「第 4 阶段：图片相关」）。不接受模型给的会话 ID（D21）。
   也接受公开 http(s) 图片 URL：经过与 read_source 相同的 SSRF 校验后下载。
 - 清洗：移植自旧插件 maibot-picimagesearch `image_prepare.py`（MIT，本项目作者自己的前身项目）：
-  只接受 JPEG/PNG/WebP/GIF，取第一帧，应用 EXIF 方向，透明合成到白底，重新编码为不含元数据的 JPEG，≤2MB。
+  只接受 JPEG/PNG/WebP/GIF，取第一帧，应用 EXIF 方向，透明合成到白底，重新编码为不含元数据的 JPEG（最长边 1280，≤1MB）。
   外发给第三方的永远是清洗后的字节，不转发 QQ CDN 链接（可能带令牌）。
 - dHash：64 位差值哈希，用于"同一张图"判断与账本里只存哈希不存图片（ARCHITECTURE L3）。
 """
@@ -25,7 +25,9 @@ from .net import Outcome, SourceError
 
 MAX_INPUT_BYTES = 15 * 1024 * 1024
 MAX_PIXELS = 16_000_000
-MAX_OUTPUT_BYTES = 2_000_000
+# 0.6.1（用户要求）：上传前统一压缩。以图搜服务自己会缩到 1000 像素左右再比对，原图大只浪费上传和等待时间
+UPLOAD_SIDE = 1280
+MAX_OUTPUT_BYTES = 1_000_000
 
 
 class ImageInputError(Exception):
@@ -68,8 +70,14 @@ def prepare_image(data: bytes) -> PreparedImage:
                 with closing(img.convert("RGBA")) as rgba, closing(rgba.getchannel("A")) as alpha:
                     clean.paste(rgba, mask=alpha)
             dh = dhash_image(clean)
+            if max(clean.size) > UPLOAD_SIDE:
+                scale = UPLOAD_SIDE / max(clean.size)
+                resized = clean.resize((max(1, round(clean.width * scale)), max(1, round(clean.height * scale))),
+                                       Image.Resampling.LANCZOS)
+                clean.close()
+                clean = resized
             for step in range(7):
-                for quality in (90, 80, 65, 50, 35):
+                for quality in (85, 75, 65, 50, 35):
                     with BytesIO() as out:
                         clean.save(out, format="JPEG", quality=quality, optimize=True)
                         result = out.getvalue()
@@ -81,7 +89,7 @@ def prepare_image(data: bytes) -> PreparedImage:
                 resized = clean.resize(size, Image.Resampling.LANCZOS)
                 clean.close()
                 clean = resized
-            raise ImageInputError("图片无法压缩到 2 MB 以内")
+            raise ImageInputError("图片无法压缩到 1 MB 以内")
     except ImageInputError:
         raise
     except (Image.DecompressionBombWarning, Image.DecompressionBombError):
